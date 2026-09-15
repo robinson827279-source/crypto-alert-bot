@@ -1,4 +1,60 @@
-""" Multi-Factor Crypto Market Analysis & Trade Setup Bot ====================================================== This version keeps the existing Binance + Telegram plumbing, but replaces simple EMA9/21 + RSI timeframe voting with a transparent, multi-factor setup engine. Main flow: MARKET UNIVERSE -> LIQUIDITY FILTER -> OPPORTUNITY FILTER -> OHLCV / INDICATORS -> MARKET STRUCTURE -> S/R + SUPPLY/DEMAND -> PRICE ACTION -> VOLUME + MOMENTUM + VOLATILITY -> LIQUIDITY -> MULTI-TIMEFRAME CONTEXT -> MARKET REGIME / OVEREXTENSION -> BTC / ALT CONTEXT -> ENTRY CONFIRMATION -> STRUCTURAL SL / LOGICAL TP -> SETUP QUALITY SCORE -> RANKING -> TELEGRAM IMPORTANT: - This is a rule-based market scanner, not a guaranteed predictor. - The score is NOT a probability. Do not call it "80% confidence" unless it is later statistically calibrated with out-of-sample backtesting. - Every factor is returned explicitly so it can be logged and backtested. - The bot does not force a daily trade quota. Zero confirmed setups is valid. Dependencies: pip install requests pandas numpy Environment variables: TELEGRAM_TOKEN TELEGRAM_CHAT_ID Optional environment variables: CMC_TOP_N=50 MAX_MARKET_SCAN=50 MAX_DEEP_ANALYSIS=25 CMC_API_KEY=optional MIN_24H_QUOTE_VOLUME=10000000 MIN_TRADES_24H=5000 SCAN_INTERVAL_MINUTES=10 SEND_WATCHLIST=true SEND_NO_TRADE_SUMMARY=true MIN_SETUP_SCORE=8 MIN_RR=2.0 MAX_SPREAD_PCT=0.25 TRADE_STATE_FILE=tracked_setups.json TRACKED_SETUP_MAX_AGE_HOURS=72 """
+"""
+Multi-Factor Crypto Market Analysis & Trade Setup Bot v5
+===========================================================
+
+This version keeps the existing Binance + Telegram plumbing, but replaces
+simple EMA9/21 + RSI timeframe voting with a transparent, multi-factor setup
+engine.
+
+Main flow:
+    MARKET UNIVERSE
+    -> LIQUIDITY FILTER
+    -> OPPORTUNITY FILTER
+    -> OHLCV / INDICATORS
+    -> MARKET STRUCTURE
+    -> S/R + SUPPLY/DEMAND
+    -> PRICE ACTION
+    -> VOLUME + MOMENTUM + VOLATILITY
+    -> LIQUIDITY
+    -> MULTI-TIMEFRAME CONTEXT
+    -> MARKET REGIME / OVEREXTENSION
+    -> BTC / ALT CONTEXT
+    -> ENTRY CONFIRMATION
+    -> STRUCTURAL SL / LOGICAL TP
+    -> SETUP QUALITY SCORE
+    -> RANKING
+    -> TELEGRAM
+
+IMPORTANT:
+- This is a rule-based market scanner, not a guaranteed predictor.
+- The score is NOT a probability. Do not call it "80% confidence" unless
+  it is later statistically calibrated with out-of-sample backtesting.
+- Every factor is returned explicitly so it can be logged and backtested.
+- The bot does not force a daily trade quota. Zero confirmed setups is valid.
+
+Dependencies:
+    pip install requests pandas numpy
+
+Environment variables:
+    TELEGRAM_TOKEN
+    TELEGRAM_CHAT_ID
+
+Optional environment variables:
+    CMC_TOP_N=50
+    MAX_MARKET_SCAN=50
+    MAX_DEEP_ANALYSIS=25
+    CMC_API_KEY=optional
+    MIN_24H_QUOTE_VOLUME=10000000
+    MIN_TRADES_24H=5000
+    SCAN_INTERVAL_MINUTES=10
+    SEND_WATCHLIST=true
+    SEND_NO_TRADE_SUMMARY=true
+    MIN_SETUP_SCORE=8
+    MIN_RR=2.0
+    MAX_SPREAD_PCT=0.25
+    TRADE_STATE_FILE=tracked_setups.json
+    TRACKED_SETUP_MAX_AGE_HOURS=72
+"""
 
 import os
 import sys
@@ -107,20 +163,32 @@ TELEGRAM_MAX_LEN = 3800
 REQUEST_TIMEOUT = 12
 
 # Confirmed setups are tracked after the alert is sent. The state file prevents
-# duplicate alerts and lets the bot report entry/TP1/TP2/SL events. For a
+# duplicate alerts and lets the bot report entry/TP1-TP5/SL events. For a
 # truly continuous 24/7 process this file persists between scans.
 TRADE_STATE_FILE = os.environ.get("TRADE_STATE_FILE", "tracked_setups.json")
 TRACKED_SETUP_MAX_AGE_HOURS = int(os.environ.get("TRACKED_SETUP_MAX_AGE_HOURS", "72"))
 PRICE_EVENT_TOLERANCE_PCT = float(os.environ.get("PRICE_EVENT_TOLERANCE_PCT", "0.05"))
+STATE_SAVE_EVERY_CYCLE = os.environ.get("STATE_SAVE_EVERY_CYCLE", "true").lower() == "true"
+
+# Long-running mode is the preferred deployment. GitHub Actions can still use
+# --once for a one-shot test, but it is not a true 24/7 host.
+MAX_RUNTIME_HOURS = float(os.environ.get("MAX_RUNTIME_HOURS", "0"))  # 0 = unlimited
+
 
 # ------------------------- HTTP HELPERS -------------------------
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "MultiFactorCryptoBot/2.0"})
+SESSION.headers.update({"User-Agent": "MultiFactorCryptoBot/5.0"})
 
 
 def get_json(url: str, params: Optional[dict] = None):
-    """GET JSON, failing over across Binance public market-data hosts. GitHub Actions can receive HTTP 451 from one Binance host depending on the runner/IP location. Public market-data endpoints are also available through data-api.binance.vision, so do not make one host a single point of failure. Non-Binance URLs (for example Google News RSS) are requested normally. """
+    """GET JSON, failing over across Binance public market-data hosts.
+
+    GitHub Actions can receive HTTP 451 from one Binance host depending on the
+    runner/IP location. Public market-data endpoints are also available through
+    data-api.binance.vision, so do not make one host a single point of failure.
+    Non-Binance URLs (for example Google News RSS) are requested normally.
+    """
     if "binance.com" not in url and "binance.vision" not in url:
         resp = SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
@@ -165,9 +233,14 @@ WRAPPED_NAME_WORDS = ("wrapped", "staked ether", "liquid staking", "bridged")
 
 
 def fetch_cmc_top_assets(limit: int = CMC_FETCH_N) -> list[dict]:
-    """Fetch CMC market-cap-ranked assets for the current market universe. CMC documents the listings endpoint as the ranked market-cap list. We fetch more than 50 rows because stablecoins/wrapped assets are excluded before selecting the first CMC_TOP_N eligible assets. """
+    """Fetch CMC market-cap-ranked assets for the current market universe.
+
+    CMC documents the listings endpoint as the ranked market-cap list. We fetch
+    more than 50 rows because stablecoins/wrapped assets are excluded before
+    selecting the first CMC_TOP_N eligible assets.
+    """
     url = CMC_PRO_URL if CMC_API_KEY else CMC_PUBLIC_URL
-    headers = {"Accept": "application/json", "User-Agent": "MultiFactorCryptoBot/3.0"}
+    headers = {"Accept": "application/json", "User-Agent": "MultiFactorCryptoBot/4.0"}
     if CMC_API_KEY:
         headers["X-CMC_PRO_API_KEY"] = CMC_API_KEY
     params = {"start": 1, "limit": limit, "convert": "USD"}
@@ -244,7 +317,13 @@ def fetch_book_tickers() -> dict:
 
 
 def build_market_universe() -> tuple[list[str], dict]:
-    """Build a CMC-ranked, Binance-tradable universe, then apply liquidity filters. Important distinction: - CMC top 50 is the screening universe. - Binance liquidity/tradability decides which of those can actually be traded. - Deep multi-timeframe analysis is reserved for the best candidates. """
+    """Build a CMC-ranked, Binance-tradable universe, then apply liquidity filters.
+
+    Important distinction:
+    - CMC top 50 is the screening universe.
+    - Binance liquidity/tradability decides which of those can actually be traded.
+    - Deep multi-timeframe analysis is reserved for the best candidates.
+    """
     cmc_rows = fetch_cmc_top_assets()
     cmc_assets = cmc_eligible_assets(cmc_rows) if cmc_rows else []
     exchange_symbols = set(fetch_exchange_symbols())
@@ -761,6 +840,8 @@ def candle_features(df: pd.DataFrame) -> dict:
 
     median_range = (df["high"] - df["low"]).tail(20).median()
     displacement = bool(median_range and rng >= 1.5 * median_range and body / rng >= 0.65)
+    bullish_displacement = bool(displacement and bullish)
+    bearish_displacement = bool(displacement and bearish)
 
     recent = df.tail(8)
     compression = bool(
@@ -777,6 +858,8 @@ def candle_features(df: pd.DataFrame) -> dict:
         "bullish_engulfing": bullish_engulf,
         "bearish_engulfing": bearish_engulf,
         "displacement": displacement,
+        "bullish_displacement": bullish_displacement,
+        "bearish_displacement": bearish_displacement,
         "compression": compression,
         "body_pct_range": body / rng,
     }
@@ -1107,16 +1190,32 @@ def directional_score(result: dict, direction: int) -> tuple[float, dict]:
     elif loc not in ("middle of nowhere", ""):
         factors["location"] += 1
 
-    # Price action confirmation in 15m/30m.
+    # Directional price action confirmation in 15m/30m. A bearish candle is
+    # never counted as bullish just because it is large, and vice versa.
     for r in [m15, m30]:
         c = r["candle"]
-        bullish_pa = c.get("bullish_engulfing") or c.get("displacement") or c.get("rejection") or r["breakout"]["retest"]
-        bearish_pa = c.get("bearish_engulfing") or c.get("displacement") or c.get("rejection") or r["breakout"]["retest"]
-        if (direction == 1 and bullish_pa) or (direction == -1 and bearish_pa):
+        if direction == 1:
+            directional_pa = (
+                c.get("bullish_engulfing") or
+                c.get("bullish_displacement") or
+                (c.get("rejection") and c.get("bullish")) or
+                r["breakout"].get("retest")
+            )
+        else:
+            directional_pa = (
+                c.get("bearish_engulfing") or
+                c.get("bearish_displacement") or
+                (c.get("rejection") and c.get("bearish")) or
+                r["breakout"].get("retest")
+            )
+        if directional_pa:
             factors["price_action"] += 1
             break
-    if m15["liquidity"]["sweep"]:
-        factors["price_action"] = min(2, factors["price_action"] + 1)
+    sweep = m15["liquidity"].get("sweep") or m30["liquidity"].get("sweep")
+    if sweep:
+        sweep_is_directional = (direction == 1 and "support" in sweep) or (direction == -1 and "resistance" in sweep)
+        if sweep_is_directional:
+            factors["price_action"] = min(2, factors["price_action"] + 1)
 
     # Volume confirmation.
     if m15["volume"]["relative_volume"] >= 1.2 or m30["volume"]["relative_volume"] >= 1.2:
@@ -1189,8 +1288,14 @@ def find_structural_stop(result: dict, direction: int, entry: float) -> Optional
     return max(candidates) if candidates else None
 
 
-def find_targets(result: dict, direction: int, entry: float, stop: float) -> list[float]:
-    """Build at least five logical target levels from market structure. Targets are taken from multi-timeframe S/R, swing liquidity, range boundaries and opposite supply/demand. If fewer than five distinct market levels exist, conservative R-multiple projections are used only to complete the target ladder. No target is placed below the minimum required R:R. """
+def find_target_details(result: dict, direction: int, entry: float, stop: float) -> list[dict]:
+    """Build five ordered target levels and preserve the reason for each level.
+
+    Market-derived levels are preferred. If the available chart does not contain
+    five distinct valid levels, R-multiple projections complete the ladder. The
+    projections are explicitly labelled as projections rather than pretending
+    they are chart resistance/support.
+    """
     risk = abs(entry - stop)
     if risk <= 0:
         return []
@@ -1203,55 +1308,74 @@ def find_targets(result: dict, direction: int, entry: float, stop: float) -> lis
         sr = tf["sr"]
         levels = sr["resistances"] if direction == 1 else sr["supports"]
         for level in levels:
+            level = float(level)
             if (direction == 1 and level > entry) or (direction == -1 and level < entry):
-                candidates.append((float(level), f"{tf_name} S/R"))
+                candidates.append((level, f"{tf_name} S/R"))
 
         liq = tf["liquidity"]
         level = liq["major_swing_high"] if direction == 1 else liq["major_swing_low"]
-        if level and ((direction == 1 and level > entry) or (direction == -1 and level < entry)):
-            candidates.append((float(level), f"{tf_name} swing liquidity"))
+        if level:
+            level = float(level)
+            if (direction == 1 and level > entry) or (direction == -1 and level < entry):
+                candidates.append((level, f"{tf_name} swing liquidity"))
 
         structure = tf["structure"]
-        for level, reason in [(structure.get("range_high"), f"{tf_name} range high"),
-                              (structure.get("range_low"), f"{tf_name} range low")]:
-            if level and ((direction == 1 and level > entry) or (direction == -1 and level < entry)):
-                candidates.append((float(level), reason))
+        for level, reason in [
+            (structure.get("range_high"), f"{tf_name} range high"),
+            (structure.get("range_low"), f"{tf_name} range low"),
+        ]:
+            if level:
+                level = float(level)
+                if (direction == 1 and level > entry) or (direction == -1 and level < entry):
+                    candidates.append((level, reason))
 
         sd = tf.get("supply_demand", {})
         zone = sd.get("nearest_supply") if direction == 1 else sd.get("nearest_demand")
         if zone:
             level = zone.get("low") if direction == 1 else zone.get("high")
-            if level and ((direction == 1 and level > entry) or (direction == -1 and level < entry)):
-                candidates.append((float(level), f"{tf_name} opposite supply/demand"))
+            if level:
+                level = float(level)
+                if (direction == 1 and level > entry) or (direction == -1 and level < entry):
+                    candidates.append((level, f"{tf_name} opposite supply/demand"))
 
-    min_rr = MIN_RR
-    candidates = [(p, r) for p, r in candidates if abs(p - entry) / risk >= min_rr]
+    # Keep chart targets at or above the configured minimum R:R. This prevents
+    # a very close resistance/support level from being presented as TP1 for a
+    # setup whose minimum acceptable reward is higher.
+    candidates = [
+        (p, reason) for p, reason in candidates
+        if abs(p - entry) / risk >= MIN_RR
+    ]
     candidates.sort(key=lambda x: x[0], reverse=direction == -1)
 
-    # Deduplicate nearby levels while preserving the market-derived reason.
     market_targets = []
     for price, reason in candidates:
-        if not market_targets or abs(price - market_targets[-1][0]) / max(abs(market_targets[-1][0]), 1e-12) * 100 > 0.25:
-            market_targets.append((price, reason))
+        if not market_targets or _pct_distance(price, market_targets[-1]["price"]) > 0.25:
+            market_targets.append({"price": price, "reason": reason, "source": "market"})
 
-    targets = [p for p, _ in market_targets[:5]]
+    details = market_targets[:5]
 
-    # Complete the ladder with conservative R projections only when the
-    # available chart levels do not provide five distinct targets.
-    projection_rrs = [1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0]
+    # Complete the five-target ladder with transparent R projections. We only
+    # add a projection when it is distinct from an existing level.
+    projection_rrs = [2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0]
     for rr in projection_rrs:
-        if len(targets) >= 5:
+        if len(details) >= 5:
             break
-        projected = entry + direction * risk * rr
-        if all(abs(projected - x) / max(abs(x), 1e-12) * 100 > 0.25 for x in targets):
-            # Keep projected targets in correct directional order.
-            if direction == 1 and projected > entry:
-                targets.append(projected)
-            elif direction == -1 and projected < entry:
-                targets.append(projected)
-            targets.sort(reverse=direction == -1)
+        projected = float(entry + direction * risk * rr)
+        if all(_pct_distance(projected, x["price"]) > 0.25 for x in details):
+            if (direction == 1 and projected > entry) or (direction == -1 and projected < entry):
+                details.append({
+                    "price": projected,
+                    "reason": f"{rr:.1f}R projection",
+                    "source": "projection",
+                })
+        details.sort(key=lambda x: x["price"], reverse=direction == -1)
 
-    return targets[:5]
+    return details[:5]
+
+
+def find_targets(result: dict, direction: int, entry: float, stop: float) -> list[float]:
+    """Compatibility wrapper returning only the five target prices."""
+    return [x["price"] for x in find_target_details(result, direction, entry, stop)]
 
 def evaluate_entry_sequence(result: dict, direction: int) -> tuple[bool, list[str]]:
     tf = result["tf_results"]
@@ -1276,11 +1400,28 @@ def evaluate_entry_sequence(result: dict, direction: int) -> tuple[bool, list[st
     if not location_ok:
         reasons.append("no favorable support/resistance or supply/demand location")
 
-    sweep = m15["liquidity"]["sweep"] or m30["liquidity"]["sweep"]
-    pa = m15["candle"]
-    displacement = pa["displacement"] or m30["candle"]["displacement"]
-    if not (sweep or displacement or pa["rejection"] or pa["bullish_engulfing"] or pa["bearish_engulfing"]):
-        reasons.append("no price-action confirmation")
+    sweep = m15["liquidity"].get("sweep") or m30["liquidity"].get("sweep")
+    sweep_is_directional = bool(sweep and ((direction == 1 and "support" in sweep) or (direction == -1 and "resistance" in sweep)))
+    pa15 = m15["candle"]
+    pa30 = m30["candle"]
+    if direction == 1:
+        directional_pa = (
+            pa15.get("bullish_displacement") or pa30.get("bullish_displacement") or
+            (pa15.get("rejection") and pa15.get("bullish")) or
+            (pa30.get("rejection") and pa30.get("bullish")) or
+            pa15.get("bullish_engulfing") or pa30.get("bullish_engulfing") or
+            sweep_is_directional
+        )
+    else:
+        directional_pa = (
+            pa15.get("bearish_displacement") or pa30.get("bearish_displacement") or
+            (pa15.get("rejection") and pa15.get("bearish")) or
+            (pa30.get("rejection") and pa30.get("bearish")) or
+            pa15.get("bearish_engulfing") or pa30.get("bearish_engulfing") or
+            sweep_is_directional
+        )
+    if not directional_pa:
+        reasons.append("no directional price-action confirmation")
 
     volume_ok = m15["volume"]["relative_volume"] >= 1.0 or m30["volume"]["relative_volume"] >= 1.0
     if not volume_ok:
@@ -1312,7 +1453,8 @@ def build_trade(result: dict, direction: int) -> dict:
             "reasons": ["structural stop is too wide for current volatility"],
         }
 
-    targets = find_targets(result, direction, entry, stop)
+    target_details = find_target_details(result, direction, entry, stop)
+    targets = [x["price"] for x in target_details]
     if len(targets) < 5:
         return {
             "valid": False,
@@ -1330,6 +1472,7 @@ def build_trade(result: dict, direction: int) -> dict:
         "entry": entry,
         "stop_loss": stop,
         "targets": targets,
+        "target_details": target_details,
         "risk_distance": risk,
         "risk_pct": risk / entry * 100,
         "rr": rr_values[0],
@@ -1519,6 +1662,7 @@ def create_tracked_setup(result: dict) -> dict:
         "entry": float(trade["entry"]),
         "stop_loss": float(trade["stop_loss"]),
         "targets": [float(x) for x in targets[:5]],
+        "target_details": [dict(x) for x in trade.get("target_details", [])[:5]],
         "rr": float(trade.get("rr", 0)),
         "setup_score": float(result.get("setup_score", 0)),
         "factor_scores": result.get("factor_scores", {}),
@@ -1536,7 +1680,13 @@ def create_tracked_setup(result: dict) -> dict:
 
 
 def track_price_event(setup: dict, price: float) -> Optional[dict]:
-    """Advance one tracked setup using the current market price. If TP and SL are both crossed between scans, the bot cannot know which happened first from a single ticker price. It therefore fetches the next available 15m candle when possible; if order cannot be established, it records an ambiguous event rather than inventing a favorable outcome. """
+    """Advance one tracked setup using the current market price.
+
+    If TP and SL are both crossed between scans, the bot cannot know which
+    happened first from a single ticker price. It therefore fetches the next
+    available 15m candle when possible; if order cannot be established, it
+    records an ambiguous event rather than inventing a favorable outcome.
+    """
     direction = 1 if setup["direction"] == "BUY" else -1
     entry = setup["entry"]
     stop = setup["stop_loss"]
@@ -1568,7 +1718,12 @@ def track_price_event(setup: dict, price: float) -> Optional[dict]:
         return events or None
 
     # Mark every target crossed by the current price. If one scan jumps over
-    # several levels, all crossed targets are reported in ladder order.
+    # several levels, all newly crossed targets are reported in ladder order.
+    # Keep track of targets crossed in THIS snapshot separately from targets
+    # hit in earlier scans. This is essential for the normal sequence
+    # TP1 -> TP2 -> price reversal -> SL: earlier TP hits must not make the
+    # later SL look like an ambiguous same-snapshot event.
+    newly_hit_targets = []
     for idx, target in enumerate(targets[:5], start=1):
         flag = f"tp{idx}_hit"
         if target is None or setup.get(flag):
@@ -1576,6 +1731,7 @@ def track_price_event(setup: dict, price: float) -> Optional[dict]:
         target_hit = price >= target if direction == 1 else price <= target
         if target_hit:
             setup[flag] = True
+            newly_hit_targets.append(idx)
             events.append(f"TP{idx}_HIT")
 
     if setup.get("tp5_hit"):
@@ -1586,7 +1742,19 @@ def track_price_event(setup: dict, price: float) -> Optional[dict]:
 
     if not setup.get("tp5_hit"):
         stop_hit = price <= stop if direction == 1 else price >= stop
-        if stop_hit:
+        # If a single sampled price is beyond both the stop and a target, a
+        # ticker snapshot cannot establish which level traded first. Do not
+        # manufacture a favorable result. Mark the setup ambiguous and close it
+        # for audit purposes; the history retains all target flags reached by
+        # the snapshot. In normal liquid markets this is uncommon at 5-10m scans.
+        # Ambiguous only when this SAME price snapshot newly crosses both
+        # the stop and at least one previously-unhit target. A TP reached on an
+        # earlier scan followed by a later SL is a normal stopped-out setup.
+        if stop_hit and newly_hit_targets:
+            setup["status"] = "AMBIGUOUS PRICE PATH"
+            setup["ambiguous"] = True
+            events.append("AMBIGUOUS_PATH")
+        elif stop_hit:
             setup["sl_hit"] = True
             setup["status"] = "SL HIT"
             events.append("SL_HIT")
@@ -1601,7 +1769,24 @@ def format_tracking_event(setup: dict, event: str) -> str:
     entry = fmt_price(setup["entry"])
     stop = fmt_price(setup["stop_loss"])
     targets = setup.get("targets", [])[:5]
-    tp_lines = [f"TP{i}: {fmt_price(t)} {'✅' if setup.get(f'tp{i}_hit') else 'not reached'}" for i, t in enumerate(targets, 1)]
+    details = setup.get("target_details", [])[:5]
+    tp_lines = []
+    for i, t in enumerate(targets, 1):
+        reason = details[i-1].get("reason", "market level") if i-1 < len(details) else "market level"
+        hit = setup.get(f"tp{i}_hit")
+        if hit:
+            marker = "✅"
+            state_text = "HIT"
+        elif event == "SL_HIT":
+            # Once the structural stop is reached, every unhit TP is a failed
+            # target for this setup. This gives the user an immediate final
+            # scorecard instead of leaving the remaining targets ambiguous.
+            marker = "❌"
+            state_text = "NOT REACHED"
+        else:
+            marker = "⏳"
+            state_text = "PENDING"
+        tp_lines.append(f"TP{i}: {fmt_price(t)} {marker} {state_text} | {reason}")
 
     if event == "ENTRY_TRIGGERED":
         return "\n".join([
@@ -1625,12 +1810,22 @@ def format_tracking_event(setup: dict, event: str) -> str:
         ])
 
     if event == "SL_HIT":
+        hit_count = sum(1 for i in range(1, 6) if setup.get(f"tp{i}_hit"))
         return "\n".join([
             f"❌ SL HIT | {symbol}", "", f"Bias: {direction}", f"Entry: {entry}",
             f"SL: {stop} ❌", *tp_lines, "",
-            "Result: Planned structural invalidation level was reached.",
+            f"Result: Price reversed to the structural invalidation level after {hit_count} TP milestone(s).",
             "Final status: STOPPED OUT",
-            "The bot records the setup as invalidated at its structural stop.",
+            "The setup is now closed. Any TP not reached is marked ❌ because the original setup no longer remains valid.",
+        ])
+
+    if event == "AMBIGUOUS_PATH":
+        return "\n".join([
+            f"⚠️ AMBIGUOUS PRICE PATH | {symbol}", "", f"Bias: {direction}",
+            f"Entry: {entry}", f"SL: {stop}", *tp_lines, "",
+            "Result: One ticker snapshot crossed a target and the stop, so the bot cannot know which traded first.",
+            "Final status: CLOSED FOR AUDIT",
+            "The bot does not count this as a win or loss without lower-timeframe ordering data.",
         ])
 
     return ""
@@ -1678,7 +1873,9 @@ def monitor_tracked_setups(state: dict, tickers: Optional[dict] = None) -> list[
         for event in events:
             messages.append(format_tracking_event(setup, event))
 
-        if setup.get("tp2_hit") or setup.get("sl_hit"):
+        # Keep the setup active until the full five-target plan is completed
+        # or the structural stop is hit. TP1-TP4 are milestones, not final states.
+        if setup.get("tp5_hit") or setup.get("sl_hit") or setup.get("ambiguous"):
             state.setdefault("history", []).append(setup.copy())
             del active[setup_id]
 
@@ -1752,36 +1949,40 @@ def format_setup(result: dict, rank: int, confirmed: bool) -> str:
     news = result.get("news", {})
 
     lines = [
-        f"{'🔥' if confirmed else '👀'} SETUP #{rank} | {result['symbol']}",
+        f"{'🔥' if confirmed else '👀'} SETUP #{rank}  |  {result['symbol']}",
         f"Status: {status}",
         f"Bias: {'LONG' if direction == 'BUY' else 'SHORT'}",
-        f"Market regime: {tf['4h']['regime']['regime']}",
+        f"Market regime: {tf.get('4h', {}).get('regime', {}).get('regime', 'n/a')}",
         "",
         "MARKET STRUCTURE",
-        f"8H: {tf['8h']['structure']['trend']}",
-        f"4H: {tf['4h']['structure']['trend']} | {tf['4h']['structure']['last_high']['label'] if tf['4h']['structure']['last_high'] else 'n/a'} + {tf['4h']['structure']['last_low']['label'] if tf['4h']['structure']['last_low'] else 'n/a'}",
-        f"1H: {tf['1h']['structure']['trend']} | {tf['1h']['sr']['location']}",
-        f"30M: {tf['30m']['structure']['trend']}",
-        f"15M: {tf['15m']['structure']['choch'] or tf['15m']['structure']['bos'] or 'confirmation developing'}",
+        f"8H: {tf.get('8h', {}).get('structure', {}).get('trend', 'n/a')}",
+        f"4H: {tf['4h']['structure'].get('trend', 'n/a')} | {((tf['4h']['structure'].get('last_high') or {}).get('label', 'n/a'))} + {((tf['4h']['structure'].get('last_low') or {}).get('label', 'n/a'))}",
+        f"1H: {tf.get('1h', {}).get('structure', {}).get('trend', 'n/a')} | {tf.get('1h', {}).get('sr', {}).get('location', 'n/a')}",
+        f"30M: {tf.get('30m', {}).get('structure', {}).get('trend', 'n/a')}",
+        f"15M: {tf.get('15m', {}).get('structure', {}).get('choch') or tf.get('15m', {}).get('structure', {}).get('bos') or 'confirmation developing'}",
         "",
         "KEY LEVELS",
-        f"Support: {fmt_price(tf['1h']['sr']['nearest_support']) if tf['1h']['sr']['nearest_support'] else 'n/a'}",
-        f"Resistance: {fmt_price(tf['1h']['sr']['nearest_resistance']) if tf['1h']['sr']['nearest_resistance'] else 'n/a'}",
-        f"Liquidity: {tf['15m']['liquidity']['sweep'] or 'no recent sweep'}",
+        f"Support: {fmt_price(tf.get('1h', {}).get('sr', {}).get('nearest_support')) if tf.get('1h', {}).get('sr', {}).get('nearest_support') else 'n/a'}",
+        f"Resistance: {fmt_price(tf.get('1h', {}).get('sr', {}).get('nearest_resistance')) if tf.get('1h', {}).get('sr', {}).get('nearest_resistance') else 'n/a'}",
+        f"Liquidity: {tf.get('15m', {}).get('liquidity', {}).get('sweep') or 'no recent sweep'}",
         "",
         "CONFIRMATION",
-        f"Price action: {'confirmed displacement/rejection' if (tf['15m']['candle']['displacement'] or tf['15m']['candle']['rejection']) else 'developing'}",
-        f"Volume: {tf['15m']['volume']['relative_volume']:.2f}x average",
-        f"RSI: {tf['15m']['momentum']['rsi']:.0f} ({tf['15m']['momentum']['rsi_state']})",
-        f"MACD: {'bullish' if tf['15m']['momentum']['macd_hist'] > 0 else 'bearish'} histogram",
-        f"MA context: {tf['4h']['regime']['ma_alignment']}",
+        f"Price action: {'confirmed directional displacement/rejection' if (tf.get('15m', {}).get('candle', {}).get('displacement') or tf.get('15m', {}).get('candle', {}).get('rejection')) else 'developing'}",
+        f"Volume: {tf.get('15m', {}).get('volume', {}).get('relative_volume', 1.0):.2f}x average",
+        f"RSI: {tf.get('15m', {}).get('momentum', {}).get('rsi', 50):.0f} ({tf.get('15m', {}).get('momentum', {}).get('rsi_state', 'unknown')})",
+        f"MACD: {'bullish' if tf.get('15m', {}).get('momentum', {}).get('macd_hist', 0) > 0 else 'bearish'} histogram",
+        f"MA context: {tf.get('4h', {}).get('regime', {}).get('ma_alignment', 'unknown')}",
         f"BTC/ALT context: {ctx.get('status', 'self')}",
         f"News risk: {news.get('risk', 'UNKNOWN')}",
         "",
         "TRADE PLAN",
         f"{'Entry' if confirmed else 'Planned entry / trigger'}: {fmt_price(entry) if entry is not None else 'WAIT FOR CONFIRMATION'}",
         f"SL: {fmt_price(stop) if stop is not None else 'n/a'}",
-        *([f"TP{i}: {fmt_price(t)} | R:R 1:{abs(t - entry) / abs(entry - stop):.1f}" for i, t in enumerate(targets, 1)] if targets and entry is not None and stop not in (None, entry) else ["TP1-TP5: n/a"]),
+        *([
+            f"TP{i}: {fmt_price(t)} | R:R 1:{abs(t - entry) / abs(entry - stop):.1f}"
+            f" | {((trade.get('target_details') or [])[i-1].get('reason', 'market level') if i-1 < len(trade.get('target_details') or []) else 'market level')}"
+            for i, t in enumerate(targets[:5], 1)
+        ] if targets and entry is not None and stop not in (None, entry) else ["TP1-TP5: n/a"]),
         "",
         f"Setup quality: {score}/12",
         _factor_summary(result),
@@ -1798,7 +1999,7 @@ def format_no_trade(candidates: list[dict], market_stats: dict) -> str:
     lines = [
         "🟡 NO TRADE",
         "",
-        f"CMC-ranked universe screened: {market_stats.get('cmc_ranked_assets', 0)} eligible assets",
+        f"Universe: {'CMC top-50 eligible' if not market_stats.get('fallback') else 'fallback core/liquid universe'} | screened: {market_stats.get('cmc_ranked_assets', 0)} eligible assets",
         f"Binance-tradable: {market_stats.get('cmc_tradable', 0)}",
         f"Passed liquidity filter: {market_stats.get('liquid_candidates', 0)}",
         "",
@@ -1920,21 +2121,87 @@ def run_cycle():
 
 
 
+def run_self_tests() -> None:
+    """Run deterministic checks for the failure-prone alert/tracking paths."""
+    # format_setup must tolerate missing optional swing labels.
+    base_tf = {
+        "structure": {"trend": "range", "bias": 0, "last_high": None, "last_low": None,
+                       "choch": None, "bos": None, "swings": {"highs": [], "lows": []}},
+        "sr": {"location": "middle of nowhere", "nearest_support": None, "nearest_resistance": None},
+        "supply_demand": {"nearest_demand": None, "nearest_supply": None},
+        "candle": {"displacement": False, "rejection": False, "bullish": False, "bearish": False},
+        "liquidity": {"sweep": None}, "volume": {"relative_volume": 1.0},
+        "momentum": {"rsi": 50.0, "rsi_state": "neutral", "macd_hist": 0.0},
+        "regime": {"regime": "range", "ma_alignment": "mixed"},
+        "overextension": {"overextended": False, "near_resistance": False, "near_support": False},
+        "close": 100.0,
+    }
+    result = {
+        "symbol": "TESTUSDT", "direction": "BUY", "status": "CONFIRMED", "setup_score": 8,
+        "factor_scores": {}, "rejection_reasons": [],
+        "tf_results": {x: dict(base_tf) for x in TIMEFRAMES},
+        "trade": {"entry": 100.0, "stop_loss": 95.0,
+                  "targets": [110.0, 120.0, 130.0, 140.0, 150.0],
+                  "target_details": [{"price": p, "reason": "test level"} for p in [110,120,130,140,150]],
+                  "rr": 2.0},
+    }
+    format_setup(result, 1, True)
+
+    setup = create_tracked_setup(result)
+    state = {"active": {setup["id"]: setup}, "history": []}
+    assert track_price_event(setup, 100.0) == ["ENTRY_TRIGGERED"]
+    assert track_price_event(setup, 120.0) == ["TP1_HIT", "TP2_HIT"]
+    assert setup["tp2_hit"] and setup["tp3_hit"] is False
+    monitor_tracked_setups(state, {"TESTUSDT": {"lastPrice": "120"}})
+    assert setup["id"] in state["active"], "Setup must remain active after TP2"
+
+    # Required lifecycle: TP1 and TP2 green, then price reverses to SL.
+    sl_messages = monitor_tracked_setups(state, {"TESTUSDT": {"lastPrice": "94"}})
+    assert setup["id"] not in state["active"], "Setup must close when SL is hit"
+    assert setup["sl_hit"] is True
+    assert setup["tp1_hit"] and setup["tp2_hit"]
+    assert setup["tp3_hit"] is False and setup["tp4_hit"] is False and setup["tp5_hit"] is False
+    assert any("TP1:" in m and "TP2:" in m and "TP3:" in m and "SL HIT" in m for m in sl_messages)
+
+    # Separate fresh setup must still be able to complete the full five-target ladder.
+    setup2 = create_tracked_setup(result)
+    state2 = {"active": {setup2["id"]: setup2}, "history": []}
+    assert track_price_event(setup2, 100.0) == ["ENTRY_TRIGGERED"]
+    monitor_tracked_setups(state2, {"TESTUSDT": {"lastPrice": "150"}})
+    assert setup2["id"] not in state2["active"], "Setup must close after TP5"
+    assert state2["history"][-1]["tp5_hit"] is True
+    print("SELF-TESTS PASSED")
+
+
 def main():
+    if "--self-test" in sys.argv:
+        run_self_tests()
+        return
     if "--once" in sys.argv:
         run_cycle()
         return
 
+    # Default mode is a long-running service. It monitors old confirmed setups
+    # first on every cycle, then searches for new setups. State is saved after
+    # each cycle so an unexpected restart loses at most one in-progress cycle.
+    started = time.monotonic()
     print(
-        f"Starting multi-factor crypto bot. Checking every {SCAN_INTERVAL_MINUTES} minutes. Ctrl+C to stop.\n"
+        f"Starting multi-factor crypto bot in 24/7 mode. Checking every {SCAN_INTERVAL_MINUTES} minutes. Ctrl+C to stop.\n"
     )
     while True:
+        cycle_started = time.monotonic()
         try:
             run_cycle()
         except Exception:
             print("[ERROR] Problem during cycle:")
             traceback.print_exc()
-        time.sleep(SCAN_INTERVAL_MINUTES * 60)
+        elapsed = time.monotonic() - (started if MAX_RUNTIME_HOURS else cycle_started)
+        if MAX_RUNTIME_HOURS and (time.monotonic() - started) >= MAX_RUNTIME_HOURS * 3600:
+            print("Maximum runtime reached; exiting cleanly so the supervisor can restart the bot.")
+            return
+        sleep_seconds = max(5, SCAN_INTERVAL_MINUTES * 60 - int(time.monotonic() - cycle_started))
+        print(f"Next scan in about {sleep_seconds // 60}m {sleep_seconds % 60}s.")
+        time.sleep(sleep_seconds)
 
 
 if __name__ == "__main__":
