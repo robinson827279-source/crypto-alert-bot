@@ -2,9 +2,9 @@ name: Crypto Alert Bot
 
 on:
   schedule:
-    # Runs every 2 hours. GitHub may delay this by a few minutes
-    # during busy periods — that's normal for free scheduled jobs.
-    - cron: "0 */2 * * *"
+    # Runs every 5 minutes. GitHub Actions may delay scheduled jobs
+    # during busy periods. That is normal for free scheduled workflows.
+    - cron: "*/5 * * * *"
   workflow_dispatch: {}   # lets you also trigger it manually from the Actions tab
 
 jobs:
