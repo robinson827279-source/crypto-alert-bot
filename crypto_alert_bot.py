@@ -1,5 +1,5 @@
 """
-Multi-Factor Crypto Market Analysis & Trade Setup Bot v5
+Multi-Factor Crypto Market Analysis & Trade Setup Bot v6
 ===========================================================
 
 This version keeps the existing Binance + Telegram plumbing, but replaces
@@ -46,7 +46,7 @@ Optional environment variables:
     CMC_API_KEY=optional
     MIN_24H_QUOTE_VOLUME=10000000
     MIN_TRADES_24H=5000
-    SCAN_INTERVAL_MINUTES=10
+    SCAN_INTERVAL_MINUTES=5
     SEND_WATCHLIST=true
     SEND_NO_TRADE_SUMMARY=true
     MIN_SETUP_SCORE=8
@@ -149,7 +149,7 @@ MAX_SETUP_AGE_CANDLES = 8
 
 # For local/long-running execution. Existing GitHub Actions can still invoke
 # --once; if the workflow remains every 2h, it will remain every 2h.
-SCAN_INTERVAL_MINUTES = int(os.environ.get("SCAN_INTERVAL_MINUTES", "10"))
+SCAN_INTERVAL_MINUTES = int(os.environ.get("SCAN_INTERVAL_MINUTES", "5"))
 SEND_WATCHLIST = os.environ.get("SEND_WATCHLIST", "true").lower() == "true"
 SEND_NO_TRADE_SUMMARY = os.environ.get("SEND_NO_TRADE_SUMMARY", "true").lower() == "true"
 
@@ -178,7 +178,7 @@ MAX_RUNTIME_HOURS = float(os.environ.get("MAX_RUNTIME_HOURS", "0"))  # 0 = unlim
 # ------------------------- HTTP HELPERS -------------------------
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "MultiFactorCryptoBot/5.0"})
+SESSION.headers.update({"User-Agent": "MultiFactorCryptoBot/6.0"})
 
 
 def get_json(url: str, params: Optional[dict] = None):
@@ -1763,9 +1763,32 @@ def track_price_event(setup: dict, price: float) -> Optional[dict]:
     return events or None
 
 
+def _direction_label(direction: str) -> tuple[str, str]:
+    if direction == "BUY":
+        return "🟢 LONG", "📈"
+    return "🔴 SHORT", "📉"
+
+
+def _status_emoji(status: str) -> str:
+    s = str(status).upper()
+    if "TRADE READY" in s or "CONFIRMED" in s:
+        return "🔥"
+    if "WAITING" in s:
+        return "⏳"
+    if "FORMING" in s:
+        return "👀"
+    if "WATCH" in s:
+        return "👁️"
+    if "INVALID" in s:
+        return "❌"
+    if "EXPIRED" in s:
+        return "⏰"
+    return "👀"
+
+
 def format_tracking_event(setup: dict, event: str) -> str:
     symbol = setup["symbol"]
-    direction = "LONG" if setup["direction"] == "BUY" else "SHORT"
+    direction, direction_icon = _direction_label(setup["direction"])
     entry = fmt_price(setup["entry"])
     stop = fmt_price(setup["stop_loss"])
     targets = setup.get("targets", [])[:5]
@@ -1775,57 +1798,69 @@ def format_tracking_event(setup: dict, event: str) -> str:
         reason = details[i-1].get("reason", "market level") if i-1 < len(details) else "market level"
         hit = setup.get(f"tp{i}_hit")
         if hit:
-            marker = "✅"
-            state_text = "HIT"
+            marker, state_text = "✅", "HIT"
         elif event == "SL_HIT":
-            # Once the structural stop is reached, every unhit TP is a failed
-            # target for this setup. This gives the user an immediate final
-            # scorecard instead of leaving the remaining targets ambiguous.
-            marker = "❌"
-            state_text = "NOT REACHED"
+            marker, state_text = "❌", "NOT REACHED"
         else:
-            marker = "⏳"
-            state_text = "PENDING"
-        tp_lines.append(f"TP{i}: {fmt_price(t)} {marker} {state_text} | {reason}")
+            marker, state_text = "⏳", "PENDING"
+        tp_lines.append(f"🎯 TP{i}: {fmt_price(t)} {marker} {state_text} | {reason}")
 
     if event == "ENTRY_TRIGGERED":
         return "\n".join([
-            f"🚀 ENTRY TRIGGERED | {symbol}", "", f"Bias: {direction}",
-            f"Planned entry: {entry}",
-            f"Market price at trigger: {fmt_price(setup.get('entry_price_seen') or setup['entry'])}",
-            f"SL: {stop}", *tp_lines, "",
-            "Status: MONITORING",
-            "The analyzed entry level was reached. The bot is tracking all five planned targets and the structural invalidation level.",
+            f"🚀 ENTRY TRIGGERED | {symbol}",
+            "━━━━━━━━━━━━━━━━━━",
+            f"{direction_icon} Bias: {direction}",
+            f"🚀 Entry level reached: {fmt_price(setup.get('entry_price_seen') or setup['entry'])}",
+            f"📌 Planned entry: {entry}",
+            f"🛡️ SL: {stop}",
+            *tp_lines,
+            "━━━━━━━━━━━━━━━━━━",
+            "👀 Status: MONITORING",
+            "The analyzed entry level was reached. The bot is tracking the five target milestones and structural invalidation level.",
         ])
 
     if event.startswith("TP") and event.endswith("_HIT"):
         n = int(event[2:-4])
         final = n == 5
         return "\n".join([
-            f"{'🎯' if final else '✅'} TP{n} HIT | {symbol}", "",
-            f"Bias: {direction}", f"Entry: {entry}", *tp_lines, f"SL: {stop}", "",
-            f"Result: TP{n} reached as planned.",
-            f"Final status: {'SUCCESS | TP5 REACHED' if final else f'TP{n} HIT | MONITORING'}",
-            "The original setup remains tracked for the remaining targets." if not final else "The full five-target plan reached its final target.",
+            f"{'🎯' if final else '✅'} TP{n} HIT | {symbol}",
+            "━━━━━━━━━━━━━━━━━━",
+            f"{direction_icon} Bias: {direction}",
+            f"📌 Entry: {entry}",
+            *tp_lines,
+            f"🛡️ SL: {stop}",
+            "━━━━━━━━━━━━━━━━━━",
+            f"📊 Result: TP{n} reached as planned.",
+            f"{'🏆 Final status: SUCCESS | TP5 REACHED' if final else f'👀 Status: TP{n} HIT | MONITORING'}",
+            "The setup remains active for the remaining targets." if not final else "All five planned targets were reached. Setup closed successfully.",
         ])
 
     if event == "SL_HIT":
         hit_count = sum(1 for i in range(1, 6) if setup.get(f"tp{i}_hit"))
         return "\n".join([
-            f"❌ SL HIT | {symbol}", "", f"Bias: {direction}", f"Entry: {entry}",
-            f"SL: {stop} ❌", *tp_lines, "",
-            f"Result: Price reversed to the structural invalidation level after {hit_count} TP milestone(s).",
-            "Final status: STOPPED OUT",
-            "The setup is now closed. Any TP not reached is marked ❌ because the original setup no longer remains valid.",
+            f"🔴 SL HIT | {symbol}",
+            "━━━━━━━━━━━━━━━━━━",
+            f"{direction_icon} Bias: {direction}",
+            f"📌 Entry: {entry}",
+            f"🛡️ SL: {stop} ❌",
+            *tp_lines,
+            "━━━━━━━━━━━━━━━━━━",
+            f"📊 Result: Price reached the structural invalidation level after {hit_count} TP milestone(s).",
+            "❌ Final status: STOPPED OUT",
+            "The setup is closed. Any target not reached is marked ❌ because the original setup is no longer valid.",
         ])
 
     if event == "AMBIGUOUS_PATH":
         return "\n".join([
-            f"⚠️ AMBIGUOUS PRICE PATH | {symbol}", "", f"Bias: {direction}",
-            f"Entry: {entry}", f"SL: {stop}", *tp_lines, "",
-            "Result: One ticker snapshot crossed a target and the stop, so the bot cannot know which traded first.",
-            "Final status: CLOSED FOR AUDIT",
-            "The bot does not count this as a win or loss without lower-timeframe ordering data.",
+            f"⚠️ AMBIGUOUS PRICE PATH | {symbol}",
+            "━━━━━━━━━━━━━━━━━━",
+            f"{direction_icon} Bias: {direction}",
+            f"📌 Entry: {entry}",
+            f"🛡️ SL: {stop}",
+            *tp_lines,
+            "━━━━━━━━━━━━━━━━━━",
+            "⚠️ Result: One price snapshot crossed a target and the stop, so order cannot be established from ticker data alone.",
+            "⛔ Final status: CLOSED FOR AUDIT",
         ])
 
     return ""
@@ -1941,59 +1976,96 @@ def format_setup(result: dict, rank: int, confirmed: bool) -> str:
     score = result.get("setup_score", 0)
     status = "TRADE READY" if confirmed else result["status"]
     direction = result["direction"]
+    direction_label, direction_icon = _direction_label(direction)
     entry = trade.get("entry") or result.get("planned_entry")
     stop = trade.get("stop_loss")
-    target1 = targets[0] if targets else None
-    target2 = targets[1] if len(targets) > 1 else None
     ctx = result.get("btc_context", {})
     news = result.get("news", {})
+    regime = tf.get("4h", {}).get("regime", {}).get("regime", "n/a")
+    news_risk = str(news.get("risk", "UNKNOWN")).upper()
+    news_icon = "🔴" if news_risk == "HIGH" else "🟠" if news_risk == "ELEVATED" else "🟢" if news_risk == "NORMAL" else "⚪"
+    vol = tf.get("15m", {}).get("volume", {}).get("relative_volume", 1.0)
+    vol_icon = "📈" if vol >= 1.2 else "📉" if vol < 0.8 else "➡️"
+    rsi = tf.get("15m", {}).get("momentum", {}).get("rsi", 50)
+    rsi_state = tf.get("15m", {}).get("momentum", {}).get("rsi_state", "unknown")
+    macd_hist = tf.get("15m", {}).get("momentum", {}).get("macd_hist", 0)
+    macd_text = "Bullish histogram" if macd_hist > 0 else "Bearish histogram"
+    pa = tf.get("15m", {}).get("candle", {})
+    pa_text = "confirmed directional displacement/rejection" if (pa.get("displacement") or pa.get("rejection")) else "developing"
+    support = tf.get("1h", {}).get("sr", {}).get("nearest_support")
+    resistance = tf.get("1h", {}).get("sr", {}).get("nearest_resistance")
+    liquidity = tf.get("15m", {}).get("liquidity", {}).get("sweep") or "no recent sweep"
+    blockers = result.get("rejection_reasons", [])
 
     lines = [
-        f"{'🔥' if confirmed else '👀'} SETUP #{rank}  |  {result['symbol']}",
-        f"Status: {status}",
-        f"Bias: {'LONG' if direction == 'BUY' else 'SHORT'}",
-        f"Market regime: {tf.get('4h', {}).get('regime', {}).get('regime', 'n/a')}",
+        f"{'🔥' if confirmed else '👀'} SETUP #{rank} | {direction_icon} {result['symbol']}",
+        f"{_status_emoji(status)} Status: {status}",
+        f"{direction_label}",
+        f"🧭 Market regime: {regime}",
         "",
-        "MARKET STRUCTURE",
-        f"8H: {tf.get('8h', {}).get('structure', {}).get('trend', 'n/a')}",
-        f"4H: {tf['4h']['structure'].get('trend', 'n/a')} | {((tf['4h']['structure'].get('last_high') or {}).get('label', 'n/a'))} + {((tf['4h']['structure'].get('last_low') or {}).get('label', 'n/a'))}",
-        f"1H: {tf.get('1h', {}).get('structure', {}).get('trend', 'n/a')} | {tf.get('1h', {}).get('sr', {}).get('location', 'n/a')}",
-        f"30M: {tf.get('30m', {}).get('structure', {}).get('trend', 'n/a')}",
-        f"15M: {tf.get('15m', {}).get('structure', {}).get('choch') or tf.get('15m', {}).get('structure', {}).get('bos') or 'confirmation developing'}",
+        "━━━━━━━━━━━━━━━━━━",
+        "📐 MARKET STRUCTURE",
+        "━━━━━━━━━━━━━━━━━━",
+        f"8H 📈/📉: {tf.get('8h', {}).get('structure', {}).get('trend', 'n/a')}",
+        f"4H 📈/📉: {tf.get('4h', {}).get('structure', {}).get('trend', 'n/a')} | {((tf.get('4h', {}).get('structure', {}).get('last_high') or {}).get('label', 'n/a'))} + {((tf.get('4h', {}).get('structure', {}).get('last_low') or {}).get('label', 'n/a'))}",
+        f"1H 📊: {tf.get('1h', {}).get('structure', {}).get('trend', 'n/a')} | {tf.get('1h', {}).get('sr', {}).get('location', 'n/a')}",
+        f"30M 🔄: {tf.get('30m', {}).get('structure', {}).get('trend', 'n/a')}",
+        f"15M ⏳: {tf.get('15m', {}).get('structure', {}).get('choch') or tf.get('15m', {}).get('structure', {}).get('bos') or 'confirmation developing'}",
         "",
-        "KEY LEVELS",
-        f"Support: {fmt_price(tf.get('1h', {}).get('sr', {}).get('nearest_support')) if tf.get('1h', {}).get('sr', {}).get('nearest_support') else 'n/a'}",
-        f"Resistance: {fmt_price(tf.get('1h', {}).get('sr', {}).get('nearest_resistance')) if tf.get('1h', {}).get('sr', {}).get('nearest_resistance') else 'n/a'}",
-        f"Liquidity: {tf.get('15m', {}).get('liquidity', {}).get('sweep') or 'no recent sweep'}",
+        "━━━━━━━━━━━━━━━━━━",
+        "🎯 KEY LEVELS",
+        "━━━━━━━━━━━━━━━━━━",
+        f"🟩 Support: {fmt_price(support) if support else 'n/a'}",
+        f"🟥 Resistance: {fmt_price(resistance) if resistance else 'n/a'}",
+        f"💧 Liquidity: {liquidity}",
         "",
-        "CONFIRMATION",
-        f"Price action: {'confirmed directional displacement/rejection' if (tf.get('15m', {}).get('candle', {}).get('displacement') or tf.get('15m', {}).get('candle', {}).get('rejection')) else 'developing'}",
-        f"Volume: {tf.get('15m', {}).get('volume', {}).get('relative_volume', 1.0):.2f}x average",
-        f"RSI: {tf.get('15m', {}).get('momentum', {}).get('rsi', 50):.0f} ({tf.get('15m', {}).get('momentum', {}).get('rsi_state', 'unknown')})",
-        f"MACD: {'bullish' if tf.get('15m', {}).get('momentum', {}).get('macd_hist', 0) > 0 else 'bearish'} histogram",
-        f"MA context: {tf.get('4h', {}).get('regime', {}).get('ma_alignment', 'unknown')}",
-        f"BTC/ALT context: {ctx.get('status', 'self')}",
-        f"News risk: {news.get('risk', 'UNKNOWN')}",
+        "━━━━━━━━━━━━━━━━━━",
+        "🔎 CONFIRMATION",
+        "━━━━━━━━━━━━━━━━━━",
+        f"🕯️ Price action: {pa_text}",
+        f"📊 Volume: {vol:.2f}x average {vol_icon}",
+        f"💪 RSI: {rsi:.0f} | {rsi_state}",
+        f"📊 MACD: {macd_text}",
+        f"📏 MA context: {tf.get('4h', {}).get('regime', {}).get('ma_alignment', 'unknown')}",
+        f"₿ BTC/ALT context: {ctx.get('status', 'self')}",
+        f"📰 News risk: {news_icon} {news_risk}",
         "",
-        "TRADE PLAN",
-        f"{'Entry' if confirmed else 'Planned entry / trigger'}: {fmt_price(entry) if entry is not None else 'WAIT FOR CONFIRMATION'}",
-        f"SL: {fmt_price(stop) if stop is not None else 'n/a'}",
-        *([
-            f"TP{i}: {fmt_price(t)} | R:R 1:{abs(t - entry) / abs(entry - stop):.1f}"
-            f" | {((trade.get('target_details') or [])[i-1].get('reason', 'market level') if i-1 < len(trade.get('target_details') or []) else 'market level')}"
-            for i, t in enumerate(targets[:5], 1)
-        ] if targets and entry is not None and stop not in (None, entry) else ["TP1-TP5: n/a"]),
+        "━━━━━━━━━━━━━━━━━━",
+        "⚡ TRADE PLAN",
+        "━━━━━━━━━━━━━━━━━━",
+        f"{'🚀 Entry' if confirmed else '📌 Planned entry / trigger'}: {fmt_price(entry) if entry is not None else 'WAIT FOR CONFIRMATION'}",
+        f"🛡️ SL: {fmt_price(stop) if stop is not None else 'n/a'}",
+    ]
+    if targets and entry is not None and stop not in (None, entry):
+        details = trade.get('target_details') or []
+        for i, t in enumerate(targets[:5], 1):
+            rr = abs(t - entry) / abs(entry - stop)
+            reason = details[i-1].get('reason', 'market level') if i-1 < len(details) else 'market level'
+            lines.append(f"🎯 TP{i}: {fmt_price(t)} | R:R 1:{rr:.1f} | {reason}")
+    else:
+        lines.append("🎯 TP1-TP5: n/a")
+    lines += [
         "",
-        f"Setup quality: {score}/12",
+        "━━━━━━━━━━━━━━━━━━",
+        "🏆 SETUP QUALITY",
+        "━━━━━━━━━━━━━━━━━━",
+        f"⭐ {score}/12",
         _factor_summary(result),
         "",
-        "WHY THIS SETUP:",
+        "━━━━━━━━━━━━━━━━━━",
+        "🧠 WHY THIS SETUP",
+        "━━━━━━━━━━━━━━━━━━",
         build_reasoning(result),
     ]
-    if not confirmed and result.get("rejection_reasons"):
-        lines.extend(["", "WHAT IS NEEDED BEFORE ENTRY:", "• " + "\n• ".join(result["rejection_reasons"][:4])])
+    if not confirmed and blockers:
+        lines += ["", "━━━━━━━━━━━━━━━━━━", "🚧 BLOCKERS", "━━━━━━━━━━━━━━━━━━"]
+        lines += ["• " + b for b in blockers[:5]]
+        lines += ["", "⏳ WHAT IS NEEDED BEFORE ENTRY"]
+        lines += ["• " + b for b in blockers[:5]]
+        lines += ["", "⚠️ NOT A TRADE YET"]
+    elif confirmed:
+        lines += ["", "🟢 TRADE READY | WAIT FOR PRICE TO REACH THE PLANNED ENTRY"]
     return "\n".join(lines)
-
 
 def format_no_trade(candidates: list[dict], market_stats: dict) -> str:
     lines = [
