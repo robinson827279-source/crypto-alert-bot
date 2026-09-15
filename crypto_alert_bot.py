@@ -70,7 +70,20 @@ import numpy as np
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "PUT_YOUR_BOT_TOKEN_HERE")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "PUT_YOUR_CHAT_ID_HERE")
 
-BINANCE_BASE_URL = "https://api.binance.com"
+# Binance provides several public market-data endpoints. The data-api endpoint
+# is documented for public /api/v3 market-data routes, including exchangeInfo,
+# klines and ticker endpoints. We try several endpoints so one restricted route
+# does not take down the whole scanner.
+BINANCE_BASE_URLS = [
+    "https://data-api.binance.vision",
+    "https://api.binance.com",
+    "https://api-gcp.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+    "https://api4.binance.com",
+]
+BINANCE_BASE_URL = BINANCE_BASE_URLS[0]
 BINANCE_KLINES_URL = f"{BINANCE_BASE_URL}/api/v3/klines"
 BINANCE_EXCHANGE_INFO_URL = f"{BINANCE_BASE_URL}/api/v3/exchangeInfo"
 BINANCE_TICKER_24H_URL = f"{BINANCE_BASE_URL}/api/v3/ticker/24hr"
@@ -143,9 +156,38 @@ SESSION.headers.update({"User-Agent": "MultiFactorCryptoBot/2.0"})
 
 
 def get_json(url: str, params: Optional[dict] = None):
-    resp = SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    return resp.json()
+    """GET JSON, failing over across Binance public market-data hosts.
+
+    GitHub Actions can receive HTTP 451 from one Binance host depending on the
+    runner/IP location. Public market-data endpoints are also available through
+    data-api.binance.vision, so do not make one host a single point of failure.
+    Non-Binance URLs (for example Google News RSS) are requested normally.
+    """
+    if "binance.com" not in url and "binance.vision" not in url:
+        resp = SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        return resp.json()
+
+    if "/api/" in url:
+        parsed_path = "/api/" + url.split("/api/", 1)[1]
+    elif "/sapi/" in url:
+        parsed_path = "/sapi/" + url.split("/sapi/", 1)[1]
+    else:
+        parsed_path = "/" + url.split("/", 3)[-1]
+    last_error = None
+    for base in BINANCE_BASE_URLS:
+        candidate = base + parsed_path
+        try:
+            resp = SESSION.get(candidate, params=params, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as exc:
+            last_error = exc
+            continue
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("No Binance market-data endpoint available")
 
 
 # ------------------------- MARKET UNIVERSE -------------------------
@@ -157,8 +199,14 @@ STABLE_BASES = {
 
 
 def fetch_exchange_symbols() -> list[str]:
-    """Return active Binance spot USDT symbols suitable for analysis."""
-    data = get_json(BINANCE_EXCHANGE_INFO_URL)
+    """Return active Binance spot USDT symbols, or [] if discovery is unavailable."""
+    try:
+        data = get_json(BINANCE_EXCHANGE_INFO_URL)
+    except Exception as exc:
+        print(f"WARNING: Binance exchangeInfo unavailable: {exc}")
+        print("WARNING: Falling back to the configured liquid-coin universe.")
+        return []
+
     symbols = []
     for item in data.get("symbols", []):
         if item.get("status") != "TRADING":
@@ -175,22 +223,52 @@ def fetch_exchange_symbols() -> list[str]:
 
 
 def fetch_24h_tickers() -> dict:
-    """Fetch 24h statistics for all Binance spot symbols."""
-    rows = get_json(BINANCE_TICKER_24H_URL)
-    return {row["symbol"]: row for row in rows}
+    """Fetch 24h statistics; return empty data instead of crashing the scan."""
+    try:
+        rows = get_json(BINANCE_TICKER_24H_URL)
+        return {row["symbol"]: row for row in rows}
+    except Exception as exc:
+        print(f"WARNING: Binance 24h ticker unavailable: {exc}")
+        return {}
 
 
 def fetch_book_tickers() -> dict:
-    """Fetch best bid/ask for spread sanity checks."""
-    rows = get_json(BINANCE_BOOK_TICKER_URL)
-    return {row["symbol"]: row for row in rows}
+    """Fetch best bid/ask; return empty data if unavailable."""
+    try:
+        rows = get_json(BINANCE_BOOK_TICKER_URL)
+        return {row["symbol"]: row for row in rows}
+    except Exception as exc:
+        print(f"WARNING: Binance book ticker unavailable: {exc}")
+        return {}
 
 
 def build_market_universe() -> tuple[list[str], dict]:
-    """Select a dynamic liquid USDT universe while preserving BTC/ETH."""
+    """
+    Select a dynamic liquid USDT universe while preserving BTC/ETH.
+
+    If Binance market discovery or 24h ticker discovery is unavailable from the
+    runner, fall back safely to the configured core + preferred universe rather
+    than crashing the entire Telegram bot.
+    """
     exchange_symbols = set(fetch_exchange_symbols())
     tickers = fetch_24h_tickers()
     books = fetch_book_tickers()
+
+    # Fallback is intentionally explicit and configurable. It keeps the bot
+    # operational if the runner receives HTTP 451 or another access failure.
+    fallback_symbols = list(dict.fromkeys(CORE_COINS + PREFERRED_COINS))
+
+    if not exchange_symbols or not tickers:
+        selected = fallback_symbols[:MAX_MARKET_SCAN]
+        if COIN_ALLOWLIST:
+            selected = [s for s in selected if s in COIN_ALLOWLIST]
+        return selected, {
+            "exchange_usdt_pairs": len(exchange_symbols),
+            "liquid_candidates": 0,
+            "selected": len(selected),
+            "tickers": tickers,
+            "fallback": True,
+        }
 
     candidates = []
     for symbol in exchange_symbols:
@@ -206,17 +284,17 @@ def build_market_universe() -> tuple[list[str], dict]:
         last_price = float(ticker.get("lastPrice", 0) or 0)
         bid = float(book.get("bidPrice", 0) or 0) if book else 0
         ask = float(book.get("askPrice", 0) or 0) if book else 0
-        spread_pct = ((ask - bid) / last_price * 100) if last_price and ask >= bid else 999
+        spread_pct = ((ask - bid) / last_price * 100) if last_price and ask >= bid else 0
 
         if quote_volume < MIN_24H_QUOTE_VOLUME:
             continue
         if trades < MIN_TRADES_24H:
             continue
-        if spread_pct > MAX_SPREAD_PCT:
+        # If book data is unavailable, don't reject the symbol solely because
+        # the spread could not be measured. If book data exists, enforce it.
+        if book and spread_pct > MAX_SPREAD_PCT:
             continue
 
-        # A simple liquidity/activity score. This is only a filter/ranking
-        # mechanism, not a trade signal.
         liquidity_score = (
             math.log10(max(quote_volume, 1)) * 2
             + math.log10(max(trades, 1))
@@ -247,12 +325,18 @@ def build_market_universe() -> tuple[list[str], dict]:
         if len(selected) >= MAX_MARKET_SCAN:
             break
 
+    # If filters are unusually restrictive, preserve the configured preferred
+    # universe rather than ending up with an empty scan.
+    if not selected:
+        selected = [s for s in fallback_symbols if s in exchange_symbols or not exchange_symbols]
+
     selected = selected[:MAX_MARKET_SCAN]
     stats = {
         "exchange_usdt_pairs": len(exchange_symbols),
         "liquid_candidates": len(candidates),
         "selected": len(selected),
         "tickers": tickers,
+        "fallback": False,
     }
     return selected, stats
 
