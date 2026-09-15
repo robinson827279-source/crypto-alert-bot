@@ -1,62 +1,11 @@
-"""
-Multi-Factor Crypto Market Analysis & Trade Setup Bot
-======================================================
-
-This version keeps the existing Binance + Telegram plumbing, but replaces
-simple EMA9/21 + RSI timeframe voting with a transparent, multi-factor setup
-engine.
-
-Main flow:
-    MARKET UNIVERSE
-    -> LIQUIDITY FILTER
-    -> OPPORTUNITY FILTER
-    -> OHLCV / INDICATORS
-    -> MARKET STRUCTURE
-    -> S/R + SUPPLY/DEMAND
-    -> PRICE ACTION
-    -> VOLUME + MOMENTUM + VOLATILITY
-    -> LIQUIDITY
-    -> MULTI-TIMEFRAME CONTEXT
-    -> MARKET REGIME / OVEREXTENSION
-    -> BTC / ALT CONTEXT
-    -> ENTRY CONFIRMATION
-    -> STRUCTURAL SL / LOGICAL TP
-    -> SETUP QUALITY SCORE
-    -> RANKING
-    -> TELEGRAM
-
-IMPORTANT:
-- This is a rule-based market scanner, not a guaranteed predictor.
-- The score is NOT a probability. Do not call it "80% confidence" unless
-  it is later statistically calibrated with out-of-sample backtesting.
-- Every factor is returned explicitly so it can be logged and backtested.
-- The bot does not force a daily trade quota. Zero confirmed setups is valid.
-
-Dependencies:
-    pip install requests pandas numpy
-
-Environment variables:
-    TELEGRAM_TOKEN
-    TELEGRAM_CHAT_ID
-
-Optional environment variables:
-    MAX_MARKET_SCAN=100
-    MAX_DEEP_ANALYSIS=25
-    MIN_24H_QUOTE_VOLUME=10000000
-    MIN_TRADES_24H=5000
-    SCAN_INTERVAL_MINUTES=10
-    SEND_WATCHLIST=true
-    SEND_NO_TRADE_SUMMARY=true
-    MIN_SETUP_SCORE=8
-    MIN_RR=2.0
-    MAX_SPREAD_PCT=0.25
-"""
+""" Multi-Factor Crypto Market Analysis & Trade Setup Bot ====================================================== This version keeps the existing Binance + Telegram plumbing, but replaces simple EMA9/21 + RSI timeframe voting with a transparent, multi-factor setup engine. Main flow: MARKET UNIVERSE -> LIQUIDITY FILTER -> OPPORTUNITY FILTER -> OHLCV / INDICATORS -> MARKET STRUCTURE -> S/R + SUPPLY/DEMAND -> PRICE ACTION -> VOLUME + MOMENTUM + VOLATILITY -> LIQUIDITY -> MULTI-TIMEFRAME CONTEXT -> MARKET REGIME / OVEREXTENSION -> BTC / ALT CONTEXT -> ENTRY CONFIRMATION -> STRUCTURAL SL / LOGICAL TP -> SETUP QUALITY SCORE -> RANKING -> TELEGRAM IMPORTANT: - This is a rule-based market scanner, not a guaranteed predictor. - The score is NOT a probability. Do not call it "80% confidence" unless it is later statistically calibrated with out-of-sample backtesting. - Every factor is returned explicitly so it can be logged and backtested. - The bot does not force a daily trade quota. Zero confirmed setups is valid. Dependencies: pip install requests pandas numpy Environment variables: TELEGRAM_TOKEN TELEGRAM_CHAT_ID Optional environment variables: CMC_TOP_N=50 MAX_MARKET_SCAN=50 MAX_DEEP_ANALYSIS=25 CMC_API_KEY=optional MIN_24H_QUOTE_VOLUME=10000000 MIN_TRADES_24H=5000 SCAN_INTERVAL_MINUTES=10 SEND_WATCHLIST=true SEND_NO_TRADE_SUMMARY=true MIN_SETUP_SCORE=8 MIN_RR=2.0 MAX_SPREAD_PCT=0.25 TRADE_STATE_FILE=tracked_setups.json TRACKED_SETUP_MAX_AGE_HOURS=72 """
 
 import os
 import sys
 import time
 import traceback
 import math
+import json
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from typing import Optional
@@ -88,6 +37,14 @@ BINANCE_KLINES_URL = f"{BINANCE_BASE_URL}/api/v3/klines"
 BINANCE_EXCHANGE_INFO_URL = f"{BINANCE_BASE_URL}/api/v3/exchangeInfo"
 BINANCE_TICKER_24H_URL = f"{BINANCE_BASE_URL}/api/v3/ticker/24hr"
 BINANCE_BOOK_TICKER_URL = f"{BINANCE_BASE_URL}/api/v3/ticker/bookTicker"
+
+# CoinMarketCap is used as the market-cap universe source. A keyless public
+# endpoint is available; if CMC_API_KEY is supplied, the standard endpoint is used.
+CMC_API_KEY = os.environ.get("CMC_API_KEY", "").strip()
+CMC_TOP_N = int(os.environ.get("CMC_TOP_N", "50"))
+CMC_FETCH_N = max(CMC_TOP_N + 25, 75)
+CMC_PUBLIC_URL = "https://pro-api.coinmarketcap.com/public-api/v3/cryptocurrency/listings/latest"
+CMC_PRO_URL = "https://pro-api.coinmarketcap.com/v3/cryptocurrency/listings/latest"
 
 # BTC and ETH are always part of the deep-analysis set.
 CORE_COINS = ["BTCUSDT", "ETHUSDT"]
@@ -124,7 +81,7 @@ VOLUME_LOOKBACK = 20
 SWING_LEFT = 3
 SWING_RIGHT = 3
 
-MAX_MARKET_SCAN = int(os.environ.get("MAX_MARKET_SCAN", "100"))
+MAX_MARKET_SCAN = int(os.environ.get("MAX_MARKET_SCAN", "50"))
 MAX_DEEP_ANALYSIS = int(os.environ.get("MAX_DEEP_ANALYSIS", "25"))
 MIN_24H_QUOTE_VOLUME = float(os.environ.get("MIN_24H_QUOTE_VOLUME", "10000000"))
 MIN_TRADES_24H = int(os.environ.get("MIN_TRADES_24H", "5000"))
@@ -149,6 +106,13 @@ NEWS_HEADLINE_COUNT = 6
 TELEGRAM_MAX_LEN = 3800
 REQUEST_TIMEOUT = 12
 
+# Confirmed setups are tracked after the alert is sent. The state file prevents
+# duplicate alerts and lets the bot report entry/TP1/TP2/SL events. For a
+# truly continuous 24/7 process this file persists between scans.
+TRADE_STATE_FILE = os.environ.get("TRADE_STATE_FILE", "tracked_setups.json")
+TRACKED_SETUP_MAX_AGE_HOURS = int(os.environ.get("TRACKED_SETUP_MAX_AGE_HOURS", "72"))
+PRICE_EVENT_TOLERANCE_PCT = float(os.environ.get("PRICE_EVENT_TOLERANCE_PCT", "0.05"))
+
 # ------------------------- HTTP HELPERS -------------------------
 
 SESSION = requests.Session()
@@ -156,13 +120,7 @@ SESSION.headers.update({"User-Agent": "MultiFactorCryptoBot/2.0"})
 
 
 def get_json(url: str, params: Optional[dict] = None):
-    """GET JSON, failing over across Binance public market-data hosts.
-
-    GitHub Actions can receive HTTP 451 from one Binance host depending on the
-    runner/IP location. Public market-data endpoints are also available through
-    data-api.binance.vision, so do not make one host a single point of failure.
-    Non-Binance URLs (for example Google News RSS) are requested normally.
-    """
+    """GET JSON, failing over across Binance public market-data hosts. GitHub Actions can receive HTTP 451 from one Binance host depending on the runner/IP location. Public market-data endpoints are also available through data-api.binance.vision, so do not make one host a single point of failure. Non-Binance URLs (for example Google News RSS) are requested normally. """
     if "binance.com" not in url and "binance.vision" not in url:
         resp = SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
@@ -196,6 +154,49 @@ STABLE_BASES = {
     "USDT", "USDC", "BUSD", "FDUSD", "TUSD", "USDP", "DAI", "EUR",
     "TRY", "BRL", "GBP", "JPY", "AUD", "BIDR", "UAH", "RUB",
 }
+
+# Exclude assets that are not useful as normal directional spot setups.
+# This is intentionally conservative; the exact CMC top-50 membership changes over time.
+WRAPPED_OR_DERIVATIVE_SYMBOLS = {
+    "WBTC", "WETH", "STETH", "WSTETH", "WEETH", "CBETH", "RETH",
+    "SFRXETH", "MSOL", "JITOSOL", "BNSOL", "CBBTC",
+}
+WRAPPED_NAME_WORDS = ("wrapped", "staked ether", "liquid staking", "bridged")
+
+
+def fetch_cmc_top_assets(limit: int = CMC_FETCH_N) -> list[dict]:
+    """Fetch CMC market-cap-ranked assets for the current market universe. CMC documents the listings endpoint as the ranked market-cap list. We fetch more than 50 rows because stablecoins/wrapped assets are excluded before selecting the first CMC_TOP_N eligible assets. """
+    url = CMC_PRO_URL if CMC_API_KEY else CMC_PUBLIC_URL
+    headers = {"Accept": "application/json", "User-Agent": "MultiFactorCryptoBot/3.0"}
+    if CMC_API_KEY:
+        headers["X-CMC_PRO_API_KEY"] = CMC_API_KEY
+    params = {"start": 1, "limit": limit, "convert": "USD"}
+    try:
+        resp = SESSION.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("data", [])
+    except Exception as exc:
+        print(f"WARNING: CoinMarketCap universe unavailable: {exc}")
+        return []
+
+
+def cmc_eligible_assets(rows: list[dict], top_n: int = CMC_TOP_N) -> list[dict]:
+    eligible = []
+    for row in rows:
+        symbol = str(row.get("symbol", "")).upper()
+        name = str(row.get("name", "")).lower()
+        if not symbol or symbol in STABLE_BASES or symbol in WRAPPED_OR_DERIVATIVE_SYMBOLS:
+            continue
+        if any(word in name for word in WRAPPED_NAME_WORDS):
+            continue
+        rank = row.get("cmc_rank")
+        if rank is None:
+            continue
+        eligible.append(row)
+        if len(eligible) >= top_n:
+            break
+    return eligible
 
 
 def fetch_exchange_symbols() -> list[str]:
@@ -243,102 +244,100 @@ def fetch_book_tickers() -> dict:
 
 
 def build_market_universe() -> tuple[list[str], dict]:
-    """
-    Select a dynamic liquid USDT universe while preserving BTC/ETH.
-
-    If Binance market discovery or 24h ticker discovery is unavailable from the
-    runner, fall back safely to the configured core + preferred universe rather
-    than crashing the entire Telegram bot.
-    """
+    """Build a CMC-ranked, Binance-tradable universe, then apply liquidity filters. Important distinction: - CMC top 50 is the screening universe. - Binance liquidity/tradability decides which of those can actually be traded. - Deep multi-timeframe analysis is reserved for the best candidates. """
+    cmc_rows = fetch_cmc_top_assets()
+    cmc_assets = cmc_eligible_assets(cmc_rows) if cmc_rows else []
     exchange_symbols = set(fetch_exchange_symbols())
     tickers = fetch_24h_tickers()
     books = fetch_book_tickers()
 
-    # Fallback is intentionally explicit and configurable. It keeps the bot
-    # operational if the runner receives HTTP 451 or another access failure.
-    fallback_symbols = list(dict.fromkeys(CORE_COINS + PREFERRED_COINS))
-
-    if not exchange_symbols or not tickers:
-        selected = fallback_symbols[:MAX_MARKET_SCAN]
-        if COIN_ALLOWLIST:
-            selected = [s for s in selected if s in COIN_ALLOWLIST]
-        return selected, {
-            "exchange_usdt_pairs": len(exchange_symbols),
+    # If CMC is unavailable, preserve operation with the configured liquid universe.
+    if not cmc_assets:
+        fallback_symbols = list(dict.fromkeys(CORE_COINS + PREFERRED_COINS))
+        selected = [s for s in fallback_symbols if not COIN_ALLOWLIST or s in COIN_ALLOWLIST]
+        return selected[:MAX_MARKET_SCAN], {
+            "cmc_ranked_assets": 0,
+            "cmc_tradable": 0,
             "liquid_candidates": 0,
-            "selected": len(selected),
+            "selected": len(selected[:MAX_MARKET_SCAN]),
             "tickers": tickers,
             "fallback": True,
         }
 
-    candidates = []
-    for symbol in exchange_symbols:
+    # If exchangeInfo is blocked but tickers work, derive tradable symbols from
+    # the ticker payload. Otherwise use the CMC symbols and let kline requests
+    # determine availability later.
+    if exchange_symbols:
+        available = exchange_symbols
+    else:
+        available = set(tickers.keys()) if tickers else set()
+
+    cmc_tradable = []
+    for row in cmc_assets:
+        symbol = f"{str(row.get('symbol', '')).upper()}USDT"
         if COIN_ALLOWLIST and symbol not in COIN_ALLOWLIST:
             continue
+        if available and symbol not in available:
+            continue
+        cmc_tradable.append({"symbol": symbol, "cmc_rank": int(row.get("cmc_rank")), "name": row.get("name", "")})
+
+    # If Binance market data is unavailable entirely, fall back instead of
+    # producing an empty universe. This keeps Telegram alive during API outages.
+    if not tickers or not cmc_tradable:
+        fallback_symbols = list(dict.fromkeys(CORE_COINS + PREFERRED_COINS))
+        fallback_symbols = [s for s in fallback_symbols if not COIN_ALLOWLIST or s in COIN_ALLOWLIST]
+        return fallback_symbols[:MAX_MARKET_SCAN], {
+            "cmc_ranked_assets": len(cmc_assets),
+            "cmc_tradable": len(cmc_tradable),
+            "liquid_candidates": 0,
+            "selected": len(fallback_symbols[:MAX_MARKET_SCAN]),
+            "tickers": tickers,
+            "fallback": True,
+        }
+
+    # Keep BTC/ETH regardless of their exact rank, provided Binance supports them.
+    core = []
+    for symbol in CORE_COINS:
+        if symbol in (available or set(tickers.keys())) and symbol not in [x["symbol"] for x in core]:
+            core.append({"symbol": symbol, "cmc_rank": 1 if symbol == "BTCUSDT" else 2, "name": symbol[:-4]})
+
+    liquid = []
+    for item in cmc_tradable:
+        symbol = item["symbol"]
         ticker = tickers.get(symbol)
         book = books.get(symbol)
         if not ticker:
             continue
-
         quote_volume = float(ticker.get("quoteVolume", 0) or 0)
         trades = int(float(ticker.get("count", 0) or 0))
         last_price = float(ticker.get("lastPrice", 0) or 0)
         bid = float(book.get("bidPrice", 0) or 0) if book else 0
         ask = float(book.get("askPrice", 0) or 0) if book else 0
         spread_pct = ((ask - bid) / last_price * 100) if last_price and ask >= bid else 0
-
-        if quote_volume < MIN_24H_QUOTE_VOLUME:
+        if quote_volume < MIN_24H_QUOTE_VOLUME or trades < MIN_TRADES_24H:
             continue
-        if trades < MIN_TRADES_24H:
-            continue
-        # If book data is unavailable, don't reject the symbol solely because
-        # the spread could not be measured. If book data exists, enforce it.
         if book and spread_pct > MAX_SPREAD_PCT:
             continue
+        activity_score = math.log10(max(quote_volume, 1)) * 2 + math.log10(max(trades, 1)) - spread_pct * 2
+        liquid.append({**item, "quote_volume": quote_volume, "trades": trades, "spread_pct": spread_pct, "activity_score": activity_score})
 
-        liquidity_score = (
-            math.log10(max(quote_volume, 1)) * 2
-            + math.log10(max(trades, 1))
-            - spread_pct * 2
-        )
-        candidates.append({
-            "symbol": symbol,
-            "quote_volume": quote_volume,
-            "trades": trades,
-            "spread_pct": spread_pct,
-            "price_change_pct": float(ticker.get("priceChangePercent", 0) or 0),
-            "liquidity_score": liquidity_score,
-        })
-
-    candidates.sort(key=lambda x: x["liquidity_score"], reverse=True)
-
-    preferred = [c for c in candidates if c["symbol"] in PREFERRED_COINS]
-    preferred.sort(key=lambda x: PREFERRED_COINS.index(x["symbol"]))
+    liquid.sort(key=lambda x: (x["cmc_rank"], -x["activity_score"]))
 
     selected = []
-    for symbol in CORE_COINS:
-        if symbol in exchange_symbols and symbol in tickers:
-            selected.append(symbol)
-
-    for item in preferred + candidates:
+    for item in core + liquid:
         if item["symbol"] not in selected:
             selected.append(item["symbol"])
         if len(selected) >= MAX_MARKET_SCAN:
             break
 
-    # If filters are unusually restrictive, preserve the configured preferred
-    # universe rather than ending up with an empty scan.
-    if not selected:
-        selected = [s for s in fallback_symbols if s in exchange_symbols or not exchange_symbols]
-
-    selected = selected[:MAX_MARKET_SCAN]
-    stats = {
-        "exchange_usdt_pairs": len(exchange_symbols),
-        "liquid_candidates": len(candidates),
-        "selected": len(selected),
+    return selected[:MAX_MARKET_SCAN], {
+        "cmc_ranked_assets": len(cmc_assets),
+        "cmc_tradable": len(cmc_tradable),
+        "liquid_candidates": len(liquid),
+        "selected": len(selected[:MAX_MARKET_SCAN]),
         "tickers": tickers,
         "fallback": False,
     }
-    return selected, stats
 
 
 # ------------------------- DATA -------------------------
@@ -1191,25 +1190,68 @@ def find_structural_stop(result: dict, direction: int, entry: float) -> Optional
 
 
 def find_targets(result: dict, direction: int, entry: float, stop: float) -> list[float]:
+    """Build at least five logical target levels from market structure. Targets are taken from multi-timeframe S/R, swing liquidity, range boundaries and opposite supply/demand. If fewer than five distinct market levels exist, conservative R-multiple projections are used only to complete the target ladder. No target is placed below the minimum required R:R. """
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return []
+
     candidates = []
-    for tf in [result["tf_results"]["15m"], result["tf_results"]["1h"], result["tf_results"]["4h"], result["tf_results"]["8h"]]:
+    for tf_name in ["15m", "30m", "1h", "4h", "8h"]:
+        tf = result["tf_results"].get(tf_name)
+        if not tf:
+            continue
         sr = tf["sr"]
         levels = sr["resistances"] if direction == 1 else sr["supports"]
         for level in levels:
             if (direction == 1 and level > entry) or (direction == -1 and level < entry):
-                candidates.append(level)
+                candidates.append((float(level), f"{tf_name} S/R"))
+
         liq = tf["liquidity"]
         level = liq["major_swing_high"] if direction == 1 else liq["major_swing_low"]
         if level and ((direction == 1 and level > entry) or (direction == -1 and level < entry)):
-            candidates.append(level)
+            candidates.append((float(level), f"{tf_name} swing liquidity"))
 
-    risk = abs(entry - stop)
-    if risk <= 0:
-        return []
-    candidates = sorted(set(round(x, 10) for x in candidates), reverse=direction == -1)
-    targets = [x for x in candidates if abs(x - entry) / risk >= MIN_RR]
-    return targets[:3]
+        structure = tf["structure"]
+        for level, reason in [(structure.get("range_high"), f"{tf_name} range high"),
+                              (structure.get("range_low"), f"{tf_name} range low")]:
+            if level and ((direction == 1 and level > entry) or (direction == -1 and level < entry)):
+                candidates.append((float(level), reason))
 
+        sd = tf.get("supply_demand", {})
+        zone = sd.get("nearest_supply") if direction == 1 else sd.get("nearest_demand")
+        if zone:
+            level = zone.get("low") if direction == 1 else zone.get("high")
+            if level and ((direction == 1 and level > entry) or (direction == -1 and level < entry)):
+                candidates.append((float(level), f"{tf_name} opposite supply/demand"))
+
+    min_rr = MIN_RR
+    candidates = [(p, r) for p, r in candidates if abs(p - entry) / risk >= min_rr]
+    candidates.sort(key=lambda x: x[0], reverse=direction == -1)
+
+    # Deduplicate nearby levels while preserving the market-derived reason.
+    market_targets = []
+    for price, reason in candidates:
+        if not market_targets or abs(price - market_targets[-1][0]) / max(abs(market_targets[-1][0]), 1e-12) * 100 > 0.25:
+            market_targets.append((price, reason))
+
+    targets = [p for p, _ in market_targets[:5]]
+
+    # Complete the ladder with conservative R projections only when the
+    # available chart levels do not provide five distinct targets.
+    projection_rrs = [1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0]
+    for rr in projection_rrs:
+        if len(targets) >= 5:
+            break
+        projected = entry + direction * risk * rr
+        if all(abs(projected - x) / max(abs(x), 1e-12) * 100 > 0.25 for x in targets):
+            # Keep projected targets in correct directional order.
+            if direction == 1 and projected > entry:
+                targets.append(projected)
+            elif direction == -1 and projected < entry:
+                targets.append(projected)
+            targets.sort(reverse=direction == -1)
+
+    return targets[:5]
 
 def evaluate_entry_sequence(result: dict, direction: int) -> tuple[bool, list[str]]:
     tf = result["tf_results"]
@@ -1251,7 +1293,7 @@ def build_trade(result: dict, direction: int) -> dict:
     entry = result["tf_results"]["15m"]["close"]
     stop = find_structural_stop(result, direction, entry)
     if stop is None:
-        return {"valid": False, "reasons": ["no structural invalidation level"]}
+        return {"valid": False, "entry": entry, "stop_loss": None, "targets": [], "reasons": ["no structural invalidation level"]}
 
     # ATR sanity check: reject absurdly tight or huge structural stops.
     atr = result["tf_results"]["15m"]["volatility"]["atr"]
@@ -1260,11 +1302,27 @@ def build_trade(result: dict, direction: int) -> dict:
         stop = entry - atr * 0.5 if direction == 1 else entry + atr * 0.5
         risk = abs(entry - stop)
     if risk > atr * 5:
-        return {"valid": False, "reasons": ["structural stop is too wide for current volatility"]}
+        return {
+            "valid": False,
+            "entry": entry,
+            "stop_loss": stop,
+            "targets": [],
+            "risk_distance": risk,
+            "risk_pct": risk / entry * 100,
+            "reasons": ["structural stop is too wide for current volatility"],
+        }
 
     targets = find_targets(result, direction, entry, stop)
-    if not targets:
-        return {"valid": False, "reasons": ["no logical target provides minimum R:R"]}
+    if len(targets) < 5:
+        return {
+            "valid": False,
+            "entry": entry,
+            "stop_loss": stop,
+            "targets": [],
+            "risk_distance": risk,
+            "risk_pct": risk / entry * 100,
+            "reasons": ["fewer than five logical target levels are available"],
+        }
 
     rr_values = [abs(tp - entry) / risk for tp in targets]
     return {
@@ -1294,6 +1352,7 @@ def analyze_coin(symbol: str, btc_result: Optional[dict] = None, news: Optional[
 
     result = {
         "symbol": symbol,
+        "news": news or {},
         "tf_results": tf_results,
         "errors": errors,
         "status": "NO TRADE",
@@ -1329,6 +1388,7 @@ def analyze_coin(symbol: str, btc_result: Optional[dict] = None, news: Optional[
         return result
 
     result["direction"] = "BUY" if direction == 1 else "SELL"
+    result["planned_entry"] = tf_results["15m"]["close"]
 
     score, factors = directional_score(result, direction)
     result["setup_score"] = score
@@ -1389,6 +1449,245 @@ def analyze_coin(symbol: str, btc_result: Optional[dict] = None, news: Optional[
     return result
 
 
+# ------------------------- SETUP TRACKING -------------------------
+
+
+def load_trade_state() -> dict:
+    """Load tracked setups from disk. Corrupt/missing state starts clean."""
+    try:
+        if not os.path.exists(TRADE_STATE_FILE):
+            return {"active": {}, "history": []}
+        with open(TRADE_STATE_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            return {"active": {}, "history": []}
+        data.setdefault("active", {})
+        data.setdefault("history", [])
+        return data
+    except Exception as exc:
+        print(f"[WARN] Could not load trade state: {exc}")
+        return {"active": {}, "history": []}
+
+
+def save_trade_state(state: dict) -> None:
+    """Atomically save setup tracking state."""
+    tmp = f"{TRADE_STATE_FILE}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2)
+        os.replace(tmp, TRADE_STATE_FILE)
+    except Exception as exc:
+        print(f"[WARN] Could not save trade state: {exc}")
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _pct_distance(a: float, b: float) -> float:
+    return abs(a - b) / max(abs(b), 1e-12) * 100.0
+
+
+def setup_matches_active(result: dict, active: dict) -> bool:
+    """Return True when a new confirmed result is materially the same setup."""
+    trade = result.get("trade", {})
+    if not trade.get("valid") or not trade.get("targets"):
+        return False
+    if active.get("symbol") != result.get("symbol"):
+        return False
+    if active.get("direction") != result.get("direction"):
+        return False
+    levels_new = [trade.get("entry"), trade.get("stop_loss")] + list(trade.get("targets", [])[:5])
+    levels_old = [active.get("entry"), active.get("stop_loss")] + list(active.get("targets", [])[:5])
+    if any(v is None for v in levels_new + levels_old):
+        return False
+    return all(_pct_distance(float(n), float(o)) <= 0.75 for n, o in zip(levels_new, levels_old))
+
+
+def create_tracked_setup(result: dict) -> dict:
+    trade = result["trade"]
+    targets = trade.get("targets", [])
+    now = datetime.now(timezone.utc).isoformat()
+    return {
+        "id": f"{result['symbol']}-{result['direction']}-{int(time.time())}",
+        "symbol": result["symbol"],
+        "direction": result["direction"],
+        "status": "MONITORING ENTRY",
+        "created_at": now,
+        "updated_at": now,
+        "entry": float(trade["entry"]),
+        "stop_loss": float(trade["stop_loss"]),
+        "targets": [float(x) for x in targets[:5]],
+        "rr": float(trade.get("rr", 0)),
+        "setup_score": float(result.get("setup_score", 0)),
+        "factor_scores": result.get("factor_scores", {}),
+        "entry_triggered": False,
+        "tp1_hit": False,
+        "tp2_hit": False,
+        "tp3_hit": False,
+        "tp4_hit": False,
+        "tp5_hit": False,
+        "sl_hit": False,
+        "entry_price_seen": None,
+        "mfe_pct": 0.0,
+        "mae_pct": 0.0,
+    }
+
+
+def track_price_event(setup: dict, price: float) -> Optional[dict]:
+    """Advance one tracked setup using the current market price. If TP and SL are both crossed between scans, the bot cannot know which happened first from a single ticker price. It therefore fetches the next available 15m candle when possible; if order cannot be established, it records an ambiguous event rather than inventing a favorable outcome. """
+    direction = 1 if setup["direction"] == "BUY" else -1
+    entry = setup["entry"]
+    stop = setup["stop_loss"]
+    targets = setup.get("targets", [])
+    tp1 = targets[0] if len(targets) >= 1 else None
+    tp2 = targets[1] if len(targets) >= 2 else None
+    tp3 = targets[2] if len(targets) >= 3 else None
+    tp4 = targets[3] if len(targets) >= 4 else None
+    tp5 = targets[4] if len(targets) >= 5 else None
+
+    move_pct = (price - entry) / entry * 100 * direction
+    adverse_pct = (entry - price) / entry * 100 * direction
+    setup["mfe_pct"] = max(float(setup.get("mfe_pct", 0)), move_pct)
+    setup["mae_pct"] = max(float(setup.get("mae_pct", 0)), adverse_pct)
+
+    events = []
+
+    # Entry is only considered triggered once price reaches/crosses the planned entry.
+    if not setup.get("entry_triggered"):
+        entry_reached = price >= entry * (1 - PRICE_EVENT_TOLERANCE_PCT / 100) if direction == 1 else price <= entry * (1 + PRICE_EVENT_TOLERANCE_PCT / 100)
+        if entry_reached:
+            setup["entry_triggered"] = True
+            setup["entry_price_seen"] = price
+            setup["status"] = "MONITORING"
+            events.append("ENTRY_TRIGGERED")
+
+    if not setup.get("entry_triggered"):
+        setup["updated_at"] = datetime.now(timezone.utc).isoformat()
+        return events or None
+
+    # Mark every target crossed by the current price. If one scan jumps over
+    # several levels, all crossed targets are reported in ladder order.
+    for idx, target in enumerate(targets[:5], start=1):
+        flag = f"tp{idx}_hit"
+        if target is None or setup.get(flag):
+            continue
+        target_hit = price >= target if direction == 1 else price <= target
+        if target_hit:
+            setup[flag] = True
+            events.append(f"TP{idx}_HIT")
+
+    if setup.get("tp5_hit"):
+        setup["status"] = "TP5 HIT"
+    elif any(setup.get(f"tp{i}_hit") for i in range(1, 6)):
+        last_hit = max(i for i in range(1, 6) if setup.get(f"tp{i}_hit"))
+        setup["status"] = f"TP{last_hit} HIT | MONITORING"
+
+    if not setup.get("tp5_hit"):
+        stop_hit = price <= stop if direction == 1 else price >= stop
+        if stop_hit:
+            setup["sl_hit"] = True
+            setup["status"] = "SL HIT"
+            events.append("SL_HIT")
+
+    setup["updated_at"] = datetime.now(timezone.utc).isoformat()
+    return events or None
+
+
+def format_tracking_event(setup: dict, event: str) -> str:
+    symbol = setup["symbol"]
+    direction = "LONG" if setup["direction"] == "BUY" else "SHORT"
+    entry = fmt_price(setup["entry"])
+    stop = fmt_price(setup["stop_loss"])
+    targets = setup.get("targets", [])[:5]
+    tp_lines = [f"TP{i}: {fmt_price(t)} {'✅' if setup.get(f'tp{i}_hit') else 'not reached'}" for i, t in enumerate(targets, 1)]
+
+    if event == "ENTRY_TRIGGERED":
+        return "\n".join([
+            f"🚀 ENTRY TRIGGERED | {symbol}", "", f"Bias: {direction}",
+            f"Planned entry: {entry}",
+            f"Market price at trigger: {fmt_price(setup.get('entry_price_seen') or setup['entry'])}",
+            f"SL: {stop}", *tp_lines, "",
+            "Status: MONITORING",
+            "The analyzed entry level was reached. The bot is tracking all five planned targets and the structural invalidation level.",
+        ])
+
+    if event.startswith("TP") and event.endswith("_HIT"):
+        n = int(event[2:-4])
+        final = n == 5
+        return "\n".join([
+            f"{'🎯' if final else '✅'} TP{n} HIT | {symbol}", "",
+            f"Bias: {direction}", f"Entry: {entry}", *tp_lines, f"SL: {stop}", "",
+            f"Result: TP{n} reached as planned.",
+            f"Final status: {'SUCCESS | TP5 REACHED' if final else f'TP{n} HIT | MONITORING'}",
+            "The original setup remains tracked for the remaining targets." if not final else "The full five-target plan reached its final target.",
+        ])
+
+    if event == "SL_HIT":
+        return "\n".join([
+            f"❌ SL HIT | {symbol}", "", f"Bias: {direction}", f"Entry: {entry}",
+            f"SL: {stop} ❌", *tp_lines, "",
+            "Result: Planned structural invalidation level was reached.",
+            "Final status: STOPPED OUT",
+            "The bot records the setup as invalidated at its structural stop.",
+        ])
+
+    return ""
+
+def monitor_tracked_setups(state: dict, tickers: Optional[dict] = None) -> list[str]:
+    """Monitor active confirmed setups and return Telegram event messages."""
+    active = state.setdefault("active", {})
+    if not active:
+        return []
+    if tickers is None:
+        tickers = fetch_24h_tickers()
+
+    messages = []
+    now = datetime.now(timezone.utc)
+    for setup_id, setup in list(active.items()):
+        symbol = setup.get("symbol")
+        row = tickers.get(symbol, {}) if tickers else {}
+        try:
+            price = float(row.get("lastPrice"))
+        except (TypeError, ValueError):
+            continue
+
+        try:
+            created = datetime.fromisoformat(setup.get("created_at", "").replace("Z", "+00:00"))
+            if (now - created).total_seconds() > TRACKED_SETUP_MAX_AGE_HOURS * 3600:
+                setup["status"] = "EXPIRED"
+                setup["updated_at"] = now.isoformat()
+                state.setdefault("history", []).append(setup.copy())
+                del active[setup_id]
+                messages.append("\n".join([
+                    f"⏰ SETUP EXPIRED | {symbol}",
+                    "",
+                    f"Bias: {'LONG' if setup['direction'] == 'BUY' else 'SHORT'}",
+                    f"Entry: {fmt_price(setup['entry'])}",
+                    f"SL: {fmt_price(setup['stop_loss'])}",
+                    "",
+                    "Result: The setup was not completed within its tracking window.",
+                    "Final status: EXPIRED",
+                ]))
+                continue
+        except Exception:
+            pass
+
+        events = track_price_event(setup, price) or []
+        for event in events:
+            messages.append(format_tracking_event(setup, event))
+
+        if setup.get("tp2_hit") or setup.get("sl_hit"):
+            state.setdefault("history", []).append(setup.copy())
+            del active[setup_id]
+
+    # Keep the local history bounded.
+    if len(state.get("history", [])) > 500:
+        state["history"] = state["history"][-500:]
+    return messages
+
+
 # ------------------------- OUTPUT / TELEGRAM -------------------------
 
 
@@ -1400,77 +1699,118 @@ def fmt_price(value: float) -> str:
     return f"{value:.8f}".rstrip("0").rstrip(".")
 
 
-def build_reasoning(result: dict) -> str:
-    tf = result["tf_results"]
-    direction = result["direction"]
-    lines = []
-    for name in ["8h", "4h", "1h", "30m", "15m"]:
-        r = tf[name]
-        lines.append(
-            f"{name}: {r['structure']['trend']}, "
-            f"BOS={r['structure']['bos'] or 'none'}, "
-            f"CHoCH={r['structure']['choch'] or 'none'}, "
-            f"RSI={r['momentum']['rsi']:.0f}, "
-            f"RVOL={r['volume']['relative_volume']:.2f}"
-        )
-
-    pa = tf["15m"]["candle"]
-    liq = tf["15m"]["liquidity"]["sweep"]
-    location = tf["1h"]["sr"]["location"]
-    if result["has_setup"]:
-        action = "bullish" if direction == "BUY" else "bearish"
-        lines.append(
-            f"Context: {action} higher timeframe structure, {location}, "
-            f"15m price action confirmed."
-        )
-        if liq:
-            lines.append(f"Liquidity: {liq}.")
-        if pa["displacement"]:
-            lines.append("Price action: displacement detected.")
-    return "\n".join(lines)
-
-
-def format_confirmed(result: dict, rank: int) -> str:
-    tf = result["tf_results"]
-    trade = result["trade"]
-    targets = trade["targets"]
-    ctx = result.get("btc_context", {})
-    score = result["factor_scores"]
+def _factor_summary(result: dict) -> str:
+    f = result.get("factor_scores", {})
     return (
-        f"#{rank} {result['symbol']}\n"
-        f"Bias: {result['direction']}\n"
-        f"Market regime: {tf['4h']['regime']['regime']}\n"
-        f"8H: {tf['8h']['structure']['trend']}\n"
-        f"4H: {tf['4h']['structure']['trend']} | "
-        f"{tf['4h']['structure']['last_high']['label'] if tf['4h']['structure']['last_high'] else 'n/a'} + "
-        f"{tf['4h']['structure']['last_low']['label'] if tf['4h']['structure']['last_low'] else 'n/a'}\n"
-        f"1H location: {tf['1h']['sr']['location']}\n"
-        f"15M confirmation: {tf['15m']['structure']['choch'] or tf['15m']['structure']['bos'] or 'confirmed price action'}\n"
-        f"Support: {fmt_price(tf['1h']['sr']['nearest_support']) if tf['1h']['sr']['nearest_support'] else 'n/a'}\n"
-        f"Resistance: {fmt_price(tf['1h']['sr']['nearest_resistance']) if tf['1h']['sr']['nearest_resistance'] else 'n/a'}\n"
-        f"Liquidity: {tf['15m']['liquidity']['sweep'] or 'no recent sweep'}\n"
-        f"Volume: RVOL {tf['15m']['volume']['relative_volume']:.2f}x\n"
-        f"RSI: {tf['15m']['momentum']['rsi']:.0f} ({tf['15m']['momentum']['rsi_state']})\n"
-        f"MACD: {'bullish' if tf['15m']['momentum']['macd_hist'] > 0 else 'bearish'} histogram\n"
-        f"MA context: {tf['4h']['regime']['ma_alignment']}\n"
-        f"Entry: {fmt_price(trade['entry'])}\n"
-        f"SL: {fmt_price(trade['stop_loss'])}\n"
-        f"TP1: {fmt_price(targets[0])}\n"
-        f"TP2: {fmt_price(targets[1]) if len(targets) > 1 else 'n/a'}\n"
-        f"R:R: 1:{trade['rr']:.1f}\n"
-        f"Setup score: {result['setup_score']}/12\n"
-        f"Factors: Structure {score['market_structure']}/2, Location {score['location']}/2, "
-        f"PA {score['price_action']}/2, Volume {score['volume']}/1, Momentum {score['momentum']}/1, "
-        f"Trend {score['trend']}/1, MTF {score['mtf_alignment']}/2, Context {score['market_context']}/1\n"
-        f"BTC/ALT: {ctx.get('status', 'self')}\n"
-        f"Status: CONFIRMED\n\n"
-        f"Why:\n{build_reasoning(result)}"
+        f"Structure {f.get('market_structure', 0)}/2 | "
+        f"Location {f.get('location', 0)}/2 | "
+        f"Price action {f.get('price_action', 0)}/2 | "
+        f"Volume {f.get('volume', 0)}/1 | "
+        f"Momentum {f.get('momentum', 0)}/1 | "
+        f"Trend {f.get('trend', 0)}/1 | "
+        f"MTF {f.get('mtf_alignment', 0)}/2 | "
+        f"Context {f.get('market_context', 0)}/1"
     )
 
 
-def format_watch(result: dict) -> str:
-    reasons = ", ".join(result["rejection_reasons"][:3]) or "confirmation still developing"
-    return f"• {result['symbol']}: {result['status']} | score {result['setup_score']}/12 | {reasons}"
+def build_reasoning(result: dict) -> str:
+    tf = result["tf_results"]
+    direction = result["direction"]
+    htf8, htf4, one, m30, m15 = tf["8h"], tf["4h"], tf["1h"], tf["30m"], tf["15m"]
+    parts = []
+    bias_word = "bullish" if direction == "BUY" else "bearish"
+    parts.append(f"Higher timeframe structure is {bias_word}: 8H {htf8['structure']['trend']}, 4H {htf4['structure']['trend']}.")
+    parts.append(f"1H is {one['structure']['trend']} and price is {one['sr']['location']}.")
+    confirmation = m15["structure"]["choch"] or m15["structure"]["bos"] or m30["structure"]["choch"] or m30["structure"]["bos"]
+    if confirmation:
+        parts.append(f"Lower timeframe confirmation: {confirmation}.")
+    else:
+        parts.append("Lower timeframe confirmation is still developing.")
+    sweep = m15["liquidity"]["sweep"] or m30["liquidity"]["sweep"]
+    if sweep:
+        parts.append(f"Liquidity: {sweep}.")
+    if m15["candle"]["displacement"] or m30["candle"]["displacement"]:
+        parts.append("Displacement is present on the confirmation timeframe.")
+    parts.append(f"Volume is {m15['volume']['relative_volume']:.2f}x average on 15M; RSI is {m15['momentum']['rsi']:.0f}; MACD histogram is {'positive' if m15['momentum']['macd_hist'] > 0 else 'negative'}.")
+    if result.get("rejection_reasons"):
+        parts.append("Current blocker(s): " + ", ".join(result["rejection_reasons"][:4]) + ".")
+    return " ".join(parts)
+
+
+def format_setup(result: dict, rank: int, confirmed: bool) -> str:
+    tf = result["tf_results"]
+    trade = result.get("trade", {})
+    targets = trade.get("targets", [])
+    score = result.get("setup_score", 0)
+    status = "TRADE READY" if confirmed else result["status"]
+    direction = result["direction"]
+    entry = trade.get("entry") or result.get("planned_entry")
+    stop = trade.get("stop_loss")
+    target1 = targets[0] if targets else None
+    target2 = targets[1] if len(targets) > 1 else None
+    ctx = result.get("btc_context", {})
+    news = result.get("news", {})
+
+    lines = [
+        f"{'🔥' if confirmed else '👀'} SETUP #{rank} | {result['symbol']}",
+        f"Status: {status}",
+        f"Bias: {'LONG' if direction == 'BUY' else 'SHORT'}",
+        f"Market regime: {tf['4h']['regime']['regime']}",
+        "",
+        "MARKET STRUCTURE",
+        f"8H: {tf['8h']['structure']['trend']}",
+        f"4H: {tf['4h']['structure']['trend']} | {tf['4h']['structure']['last_high']['label'] if tf['4h']['structure']['last_high'] else 'n/a'} + {tf['4h']['structure']['last_low']['label'] if tf['4h']['structure']['last_low'] else 'n/a'}",
+        f"1H: {tf['1h']['structure']['trend']} | {tf['1h']['sr']['location']}",
+        f"30M: {tf['30m']['structure']['trend']}",
+        f"15M: {tf['15m']['structure']['choch'] or tf['15m']['structure']['bos'] or 'confirmation developing'}",
+        "",
+        "KEY LEVELS",
+        f"Support: {fmt_price(tf['1h']['sr']['nearest_support']) if tf['1h']['sr']['nearest_support'] else 'n/a'}",
+        f"Resistance: {fmt_price(tf['1h']['sr']['nearest_resistance']) if tf['1h']['sr']['nearest_resistance'] else 'n/a'}",
+        f"Liquidity: {tf['15m']['liquidity']['sweep'] or 'no recent sweep'}",
+        "",
+        "CONFIRMATION",
+        f"Price action: {'confirmed displacement/rejection' if (tf['15m']['candle']['displacement'] or tf['15m']['candle']['rejection']) else 'developing'}",
+        f"Volume: {tf['15m']['volume']['relative_volume']:.2f}x average",
+        f"RSI: {tf['15m']['momentum']['rsi']:.0f} ({tf['15m']['momentum']['rsi_state']})",
+        f"MACD: {'bullish' if tf['15m']['momentum']['macd_hist'] > 0 else 'bearish'} histogram",
+        f"MA context: {tf['4h']['regime']['ma_alignment']}",
+        f"BTC/ALT context: {ctx.get('status', 'self')}",
+        f"News risk: {news.get('risk', 'UNKNOWN')}",
+        "",
+        "TRADE PLAN",
+        f"{'Entry' if confirmed else 'Planned entry / trigger'}: {fmt_price(entry) if entry is not None else 'WAIT FOR CONFIRMATION'}",
+        f"SL: {fmt_price(stop) if stop is not None else 'n/a'}",
+        *([f"TP{i}: {fmt_price(t)} | R:R 1:{abs(t - entry) / abs(entry - stop):.1f}" for i, t in enumerate(targets, 1)] if targets and entry is not None and stop not in (None, entry) else ["TP1-TP5: n/a"]),
+        "",
+        f"Setup quality: {score}/12",
+        _factor_summary(result),
+        "",
+        "WHY THIS SETUP:",
+        build_reasoning(result),
+    ]
+    if not confirmed and result.get("rejection_reasons"):
+        lines.extend(["", "WHAT IS NEEDED BEFORE ENTRY:", "• " + "\n• ".join(result["rejection_reasons"][:4])])
+    return "\n".join(lines)
+
+
+def format_no_trade(candidates: list[dict], market_stats: dict) -> str:
+    lines = [
+        "🟡 NO TRADE",
+        "",
+        f"CMC-ranked universe screened: {market_stats.get('cmc_ranked_assets', 0)} eligible assets",
+        f"Binance-tradable: {market_stats.get('cmc_tradable', 0)}",
+        f"Passed liquidity filter: {market_stats.get('liquid_candidates', 0)}",
+        "",
+        "No setup currently meets all conditions for a confirmed trade.",
+    ]
+    if candidates:
+        lines.extend(["", "BEST DEVELOPING OPPORTUNITIES:"])
+        for r in candidates[:3]:
+            reasons = ", ".join(r.get("rejection_reasons", [])[:2]) or "confirmation developing"
+            lines.append(f"• {r['symbol']} | {r['status']} | {r['setup_score']}/12 | {reasons}")
+    lines.extend(["", "No trade quota is enforced. The bot waits for quality rather than forcing entries."])
+    return "\n".join(lines)
 
 
 def send_telegram_message(text: str) -> None:
@@ -1512,26 +1852,23 @@ def send_long_message(text: str) -> None:
 
 def run_cycle():
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    sections = [f"📊 Multi-Factor Crypto Market Scan — {ts}"]
+    state = load_trade_state()
+
+    # Always monitor previously confirmed setups first. This means a TP/SL event
+    # can be reported even when the symbol is not selected for deep analysis in
+    # the current scan.
+    tickers = fetch_24h_tickers()
+    tracking_messages = monitor_tracked_setups(state, tickers=tickers)
+    for message in tracking_messages:
+        send_long_message(message)
 
     headlines = fetch_macro_headlines()
     news = news_context(headlines)
-    if headlines:
-        sections.append(
-            "News context: " + news["reason"] + "\n" +
-            "\n".join(f"• {h['title']} [{h['sentiment']}{', HIGH IMPACT' if h['high_impact'] else ''}]" for h in headlines[:4])
-        )
 
     symbols, market_stats = build_market_universe()
     deep_symbols = select_deep_analysis_candidates(symbols, market_stats)
 
-    sections.append(
-        f"Universe: {market_stats['exchange_usdt_pairs']} USDT pairs | "
-        f"liquid candidates: {market_stats['liquid_candidates']} | "
-        f"selected: {market_stats['selected']} | deep analysis: {len(deep_symbols)}"
-    )
-
-    # BTC first, because it is the market reference for altcoin context.
+    # BTC first because it is the market reference for altcoin context.
     btc_result = analyze_coin("BTCUSDT", btc_result=None, news=news) if "BTCUSDT" in deep_symbols else None
     results = []
     if btc_result:
@@ -1550,37 +1887,37 @@ def run_cycle():
         key=lambda r: (r["setup_score"], r.get("trade", {}).get("rr", 0)),
         reverse=True,
     )
-    watch = [r for r in results if not r["has_setup"] and r["status"] in {"WATCH", "SETUP FORMING", "WAITING FOR CONFIRMATION"}]
-
-    sections.append(
-        f"Market scan complete.\n"
-        f"Coins selected for deep analysis: {len(results)}\n"
-        f"Potential/watch setups: {len(watch)}\n"
-        f"Confirmed setups: {len(confirmed)}"
+    developing = sorted(
+        [r for r in results if not r["has_setup"] and r["status"] in {"SETUP FORMING", "WAITING FOR CONFIRMATION"} and r["setup_score"] >= 5],
+        key=lambda r: (r["setup_score"], r.get("trade", {}).get("rr", 0)),
+        reverse=True,
     )
 
-    if confirmed:
-        sections.append("🔥 CONFIRMED SETUPS")
-        for rank, result in enumerate(confirmed[:10], start=1):
-            sections.append(format_confirmed(result, rank))
-    elif SEND_NO_TRADE_SUMMARY:
-        sections.append(
-            "NO HIGH QUALITY TRADE SETUP\n"
-            "No market currently meets the minimum conditions for a confirmed entry.\n"
-            "The bot does not force a trade quota."
-        )
+    # Send each confirmed setup as its own Telegram message. Do not resend the
+    # same active setup on every scan.
+    new_confirmed_messages = []
+    for result in confirmed:
+        active_same = any(setup_matches_active(result, active) for active in state.get("active", {}).values())
+        if active_same:
+            continue
+        setup = create_tracked_setup(result)
+        state.setdefault("active", {})[setup["id"]] = setup
+        new_confirmed_messages.append(format_setup(result, len(new_confirmed_messages) + 1, confirmed=True))
 
-    if SEND_WATCHLIST and watch:
-        watch_sorted = sorted(watch, key=lambda r: r["setup_score"], reverse=True)
-        sections.append("👀 WATCHLIST / DEVELOPING")
-        sections.append("\n".join(format_watch(r) for r in watch_sorted[:8]))
+    for message in new_confirmed_messages:
+        send_long_message(message)
 
-    sections.append(
-        "⚠️ Rule-based technical/news scan only. Setup score is not a probability. "
-        "Risk should be sized around the structural stop-loss."
-    )
+    # Developing setups are intentionally limited and sent as separate messages
+    # too, but they are not added to trade tracking until confirmed.
+    if not confirmed and developing and SEND_WATCHLIST:
+        for rank, result in enumerate(developing[:3], start=1):
+            send_long_message(format_setup(result, rank, confirmed=False))
+    elif not confirmed and not developing and SEND_NO_TRADE_SUMMARY:
+        send_long_message(format_no_trade([], market_stats))
 
-    send_long_message("\n\n".join(sections))
+    save_trade_state(state)
+
+
 
 
 def main():
