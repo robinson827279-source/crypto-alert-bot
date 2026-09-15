@@ -4,7 +4,7 @@ on:
   schedule:
     # Runs every 5 minutes. GitHub Actions may delay scheduled jobs
     # during busy periods. That is normal for free scheduled workflows.
-    - cron: "*/5 * * * *"
+    - cron: "*/75 * * * *"
   workflow_dispatch: {}   # lets you also trigger it manually from the Actions tab
 
 jobs:
