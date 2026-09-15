@@ -1,0 +1,29 @@
+name: Crypto Alert Bot
+
+on:
+  schedule:
+    # Runs every 2 hours. GitHub may delay this by a few minutes
+    # during busy periods — that's normal for free scheduled jobs.
+    - cron: "0 */2 * * *"
+  workflow_dispatch: {}   # lets you also trigger it manually from the Actions tab
+
+jobs:
+  check-signals:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests pandas numpy
+
+      - name: Run bot (single pass)
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python crypto_alert_bot.py --once
